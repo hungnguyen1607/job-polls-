@@ -1,0 +1,16 @@
+[Unit]
+Description=Internship JSON feed for the web page
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/ats-scrapers
+# FEED_TOKEN=... (made by deploy/setup_server.sh)
+EnvironmentFile=%h/ats-scrapers/.env.feed
+ExecStart=%h/ats-scrapers/.venv/bin/python scripts/serve_feed.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

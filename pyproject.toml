@@ -1,0 +1,141 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ats-scrapers"
+version = "0.3.0"
+description = "Open job datasets and Python scrapers for ATS platforms and direct job sources."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [
+    { name = "Kalil Bouzigues", email = "kalil.bouzigues@gmail.com" },
+]
+keywords = [
+    "jobs",
+    "job-scraper",
+    "job-search",
+    "ats",
+    "greenhouse",
+    "lever",
+    "workday",
+    "ashby",
+    "workable",
+    "smartrecruiters",
+    "hiring",
+    "recruiting",
+    "data",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Internet :: WWW/HTTP :: Indexing/Search",
+    "Topic :: Office/Business",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+    "Typing :: Typed",
+]
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27",
+    "pydantic>=2.6",
+    "pandas>=2.0",
+]
+
+[project.optional-dependencies]
+scrapers = [
+    "aiohttp>=3.9",
+    "beautifulsoup4>=4.12",
+    "html2text>=2024.0",
+    # TLS+h2 impersonation client used as the cheap fallback when an ATS
+    # load balancer 406-blocks plain httpx (Avature, JazzHR, Eightfold).
+    # 1.6.x ships fingerprint refreshes that fix recent breakages.
+    "httpcloak>=1.6",
+    # Stealth-patched Chromium used by Tesla / Meta (Akamai bot manager
+    # blocks every cheaper fingerprint — httpcloak, curl_cffi, even
+    # Browserbase Sessions). cloakbrowser ships its own binary and
+    # caches under ~/.cache/cloakbrowser, no separate playwright install.
+    "cloakbrowser>=0.3",
+    # Moka encrypts some job-list responses with AES-CBC.
+    "pycryptodome>=3.20",
+]
+parquet = [
+    "pyarrow>=15.0",
+]
+all = [
+    "ats-scrapers[scrapers,parquet]",
+]
+# Runs the library test suite. The ops pipeline under ``pipeline/``
+# (publisher, R2 client) is repo-only — its tests additionally need
+# ``pipeline/requirements.txt``, which CI installs alongside this
+# extra.
+test = [
+    "ats-scrapers[all]",
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-httpx>=0.30",
+]
+dev = [
+    "ats-scrapers[test]",
+    "ruff>=0.5",
+    "mypy>=1.10",
+    "pandas-stubs",
+    "types-boto3",
+]
+
+[project.urls]
+Homepage = "https://github.com/kalil0321/ats-scrapers"
+Documentation = "https://github.com/kalil0321/ats-scrapers#readme"
+Repository = "https://github.com/kalil0321/ats-scrapers"
+Issues = "https://github.com/kalil0321/ats-scrapers/issues"
+Changelog = "https://github.com/kalil0321/ats-scrapers/blob/main/CHANGELOG.md"
+Dataset = "https://storage.stapply.ai/jobhive/v1/manifest.json"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ats_scrapers"]
+
+# Tests are not shipped: the suite also covers the repo-only ops code
+# under ``pipeline/``, so it only runs from a full checkout.
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src",
+    "/README.md",
+    "/LICENSE",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "C4", "SIM", "RUF"]
+# RUF001/2/3: tolerate Unicode dashes/quotes that real ATS payloads contain.
+# RUF046: harmless `int(int_already)` calls happen in defensive casts.
+ignore = ["E501", "RUF001", "RUF002", "RUF003", "RUF046"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Repo root on sys.path so tests can import the unpackaged ops code
+# under ``pipeline/``.
+pythonpath = ["."]
+asyncio_mode = "auto"
+# Live e2e tests (tests/e2e/) hit real ATS endpoints. They are doubly
+# gated: deselected by default (`-m "not live"`) AND skipped unless
+# ATS_SCRAPERS_LIVE_E2E=1. Run them with:
+#   ATS_SCRAPERS_LIVE_E2E=1 pytest -m live
+addopts = "-ra --strict-markers -m 'not live'"
+markers = [
+    "live: hits real ATS endpoints / the hosted dataset (opt-in)",
+]

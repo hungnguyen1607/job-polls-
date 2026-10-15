@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Software Internships</title>
+<style>
+  :root { --muted: #6b7280; --line: #eee; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #fff; color: #111; font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 960px; margin: 0 auto; padding: 32px 20px 64px; }
+  h1 { font-size: 20px; font-weight: 600; margin: 0 0 4px; }
+  #status { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
+  .bar { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+  .tab { border: 1px solid #ddd; background: #fff; padding: 6px 14px; border-radius: 999px; cursor: pointer; font: inherit; }
+  .tab.on { background: #111; color: #fff; border-color: #111; }
+  #q { flex: 1; min-width: 200px; border: 1px solid #ddd; border-radius: 999px; padding: 6px 14px; font: inherit; outline: none; }
+  #q:focus { border-color: #111; }
+  ul { list-style: none; margin: 0; padding: 0; }
+  li { display: grid; grid-template-columns: 1fr auto; gap: 2px 16px; padding: 12px 0; border-bottom: 1px solid var(--line); }
+  li a { color: #111; text-decoration: none; font-weight: 500; }
+  li a:hover { text-decoration: underline; }
+  .co { color: var(--muted); }
+  .when { color: var(--muted); font-size: 13px; text-align: right; white-space: nowrap; }
+  .loc { color: var(--muted); font-size: 13px; }
+  .new { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: #16a34a; margin-right: 6px; vertical-align: 1px; }
+  #empty { color: var(--muted); padding: 24px 0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Software Internships</h1>
+  <div id="status">Loading…</div>
+  <div class="bar">
+    <button class="tab on" data-region="us">US</button>
+    <button class="tab" data-region="canada">Canada</button>
+    <input id="q" type="search" placeholder="Search company, title, or city" autocomplete="off">
+  </div>
+  <ul id="list"></ul>
+  <div id="empty" hidden>No internships match.</div>
+</main>
+<script>
+  const REFRESH_MS = 60_000;
+  let feed = null, region = "us";
+  const $ = (s) => document.querySelector(s);
+  const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+  function render() {
+    if (!feed) return;
+    const q = $("#q").value.trim().toLowerCase();
+    const rows = (feed[region] || []).filter((r) =>
+      !q || `${r.company} ${r.title} ${r.location}`.toLowerCase().includes(q));
+    $("#list").innerHTML = rows.map((r) => `
+      <li>
+        <div>${/min ago/.test(r.found) ? '<span class="new" title="Found in the last hour"></span>' : ""}<a href="${esc(r.link)}" target="_blank" rel="noopener">${esc(r.title)}</a> <span class="co">· ${esc(r.company)}</span></div>
+        <div class="when">${esc(r.posted)}</div>
+        <div class="loc">${esc(r.location)}</div>
+        <div class="when">${esc(r.posted_on)}</div>
+      </li>`).join("");
+    $("#empty").hidden = rows.length > 0;
+    const mins = Math.round((Date.now() - new Date(feed.updated)) / 60000);
+    $("#status").textContent = `${rows.length} internships · updated ${mins <= 0 ? "just now" : `${mins} min ago`}`;
+  }
+
+  async function load() {
+    try {
+      const res = await fetch("/api/feed", { cache: "no-store" });
+      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || res.status);
+      feed = await res.json();
+      render();
+    } catch (err) {
+      $("#status").textContent = `Couldn't refresh (${err.message}). Retrying…`;
+    }
+  }
+
+  document.querySelectorAll(".tab").forEach((b) => b.addEventListener("click", () => {
+    document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("on", t === b));
+    region = b.dataset.region;
+    render();
+  }));
+  $("#q").addEventListener("input", render);
+  load();
+  setInterval(load, REFRESH_MS);
+  setInterval(render, 30_000);
+</script>
+</body>
+</html>
