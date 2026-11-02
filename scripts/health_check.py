@@ -33,13 +33,16 @@ REPO = Path(__file__).resolve().parent.parent
 OUT = REPO / "engineering-ats"
 WATCH_LOG = OUT / "watch.log"
 CSV_PATH = OUT / "canada_internships.csv"
+WINTER_CSV = OUT / "winter_2027_companies.csv"
 STATE = OUT / ".health_state.json"
 TOPIC_FILE = OUT / ".ntfy_topic"
 HEALTH_LOG = OUT / "health.log"
-GROUPS = ("big_ats", "bigtech", "small_ats", "canada")
+GROUPS = ("big_ats", "bigtech", "small_ats", "canada", "outreach")
 # Sources that run less often than their group (internship_core.MIN_GAP), in minutes.
-MIN_GAP = {"interndock": 30, "cgi": 30, "linkedin": 15, "workopolis": 30, "eluta": 60, "eightfold": 180, "wellfound": 30}
+MIN_GAP = {"interndock": 30, "cgi": 30, "linkedin": 15, "workopolis": 30, "eluta": 60, "eightfold": 180, "wellfound": 30, "builtin": 20}
 CSV_STALE_MIN = 15
+OUTREACH_STALE_MIN = 5
+ZERO_YIELD_MIN_CHECKED = 300
 REALERT_SECONDS = 3600
 LOG_LINE = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) (\S+)\s+(.*)$")
 CA_WORDS = re.compile(r"canada|ontario|qu[eé]bec|british columbia|alberta|manitoba|saskatchewan|"
@@ -92,8 +95,12 @@ def group_sources() -> dict[str, tuple[list[str], int]]:
         tree = ast.parse((REPO / "scripts" / f"watch_{g}.py").read_text())
         sources, interval = [], 10
         for node in ast.walk(tree):
-            if isinstance(node, ast.Assign) and any(getattr(t, "id", "") == "SOURCES" for t in node.targets):
-                sources = ast.literal_eval(node.value)
+            if isinstance(node, ast.Assign):
+                names = [getattr(t, "id", "") for t in node.targets]
+                if "SOURCES" in names:
+                    sources = ast.literal_eval(node.value)
+                if "INTERVAL_MINUTES" in names:
+                    interval = ast.literal_eval(node.value)
             if isinstance(node, ast.keyword) and node.arg == "interval_minutes":
                 interval = ast.literal_eval(node.value)
         out[g] = (sources, interval)
@@ -127,9 +134,11 @@ def check(state: dict) -> list[str]:
             problems.append(f"{unit} was {active or 'unknown'}; restarted it")
 
     # 2. Sources: last completed pass, crashes, every-company-failed passes.
-    lines = tail_lines(WATCH_LOG)
+    lines = tail_lines(WATCH_LOG, 20_000_000)
     last: dict[str, datetime] = {}
     since = now - timedelta(minutes=10)
+    day_ago = now - timedelta(hours=24)
+    day: dict[str, list[int]] = {}  # source -> [companies checked, internships found] in the last 24 h
     for line in lines:
         m = LOG_LINE.match(line)
         if not m:
@@ -137,12 +146,25 @@ def check(state: dict) -> list[str]:
         when, source, rest = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S"), m.group(2), m.group(3)
         if "checked," in rest:
             last[source] = when
+            f = re.search(r"(\d+)/\d+ checked, (\d+) open internships", rest)
+            if f and when >= day_ago:
+                d = day.setdefault(source, [0, 0])
+                # Max board count in one pass, not board×passes. Paylocity's 48
+                # companies every 30 min used to look like 2400 silent empties.
+                d[0] = max(d[0], int(f.group(1)))
+                d[1] += int(f.group(2))
         if when >= since:
             if "FAILED" in rest or "STOPPED" in rest:
                 problems.append(f"{source}: {rest[:160]}")
             c = re.search(r"(\d+)/(\d+) checked.*?(\d+) errors", rest)
             if c and int(c.group(2)) >= 5 and int(c.group(1)) == 0:
                 problems.append(f"{source}: every company failed this pass ({rest[:120]})")
+    # A scraper broken by a site change often still "checks" every company without an error
+    # and just finds nothing (BambooHR's widget switched to JSON in 2026-10).
+    for source, (checked, found) in day.items():
+        if checked >= ZERO_YIELD_MIN_CHECKED and found == 0:
+            problems.append(f"{source}: {checked} companies checked in 24 h, 0 internships found; "
+                            "the scraper may be silently broken")
     started = {}  # a group that just restarted hasn't had time to finish a pass
     for g in GROUPS:
         out_file = OUT / f"{g}.out"
@@ -165,6 +187,12 @@ def check(state: dict) -> list[str]:
     age = (time.time() - CSV_PATH.stat().st_mtime) / 60
     if age > CSV_STALE_MIN:
         problems.append(f"canada_internships.csv not updated for {age:.0f} min")
+    if not WINTER_CSV.exists():
+        problems.append("winter_2027_companies.csv hasn't been written yet")
+    else:
+        winter_age = (time.time() - WINTER_CSV.stat().st_mtime) / 60
+        if winter_age > OUTREACH_STALE_MIN:
+            problems.append(f"winter_2027_companies.csv not updated for {winter_age:.0f} min")
     return problems
 
 

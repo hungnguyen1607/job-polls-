@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Companies</title>
+<style>
+  :root { --muted: #6b7280; --line: #eee; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #fff; color: #111; font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 1040px; margin: 0 auto; padding: 32px 20px 64px; }
+  h1 { font-size: 20px; font-weight: 600; margin: 0 0 4px; }
+  #sub { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
+  nav { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
+  nav a { color: var(--muted); margin-right: 14px; }
+  .bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+  .tab { border: 1px solid #ddd; background: #fff; padding: 6px 14px; border-radius: 999px; cursor: pointer; font: inherit; }
+  .tab.on { background: #111; color: #fff; border-color: #111; }
+  input[type=search] { flex: 1; min-width: 200px; border: 1px solid #ddd; border-radius: 8px; padding: 8px 12px; font: inherit; outline: none; }
+  input[type=search]:focus { border-color: #111; }
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; font-size: 12px; font-weight: 500; color: var(--muted); padding: 6px 8px 6px 0; border-bottom: 1px solid #ddd; cursor: pointer; user-select: none; white-space: nowrap; }
+  td { padding: 10px 8px 10px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+  td.m { color: var(--muted); font-size: 13px; }
+  td a { color: #111; }
+  td.people a { color: var(--muted); font-size: 13px; margin-right: 12px; white-space: nowrap; }
+  td.people a.rec { color: #111; font-weight: 500; }
+  td.people a:hover { color: #111; }
+  td.n { color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .applied { color: var(--muted); font-size: 12px; font-weight: 400; margin-left: 8px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Companies</h1>
+  <div id="sub">Loading…</div>
+  <nav><a href="/">← Internships</a><a href="/tailor">Tailor resume</a><a href="/tracker">Application tracker</a></nav>
+  <div class="bar">
+    <button class="tab on" data-region="ca">Canada small</button>
+    <button class="tab" data-region="small">Small</button>
+    <button class="tab" data-region="sf">SF</button>
+    <button class="tab" data-region="all">All</button>
+    <button class="tab" data-region="canada">Canada</button>
+    <button class="tab" data-region="us">US</button>
+    <input id="q" type="search" placeholder="Search FreshBooks, Wealthsimple, Composio…" autofocus>
+  </div>
+  <table>
+    <thead>
+      <tr>
+        <th data-k="company">Company</th>
+        <th data-k="where">Where</th>
+        <th data-k="intern_count">Interns</th>
+        <th data-k="ping_name">Ping</th>
+        <th>People</th>
+      </tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+</main>
+<script>
+  const $ = (s) => document.querySelector(s);
+  const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+  function companySlug(url) {
+    const m = String(url || "").match(/linkedin\.com\/company\/([^/?#]+)/i);
+    return m ? decodeURIComponent(m[1].replace(/\/+$/, "")) : "";
+  }
+
+  function liSearch(path, keywords) {
+    return `https://www.linkedin.com/search/results/${path}/?keywords=${encodeURIComponent(keywords)}`;
+  }
+
+  function peopleLinks(r) {
+    const name = r.company;
+    const slug = companySlug(r.linkedin);
+    const recQ = "university recruiter OR campus recruiter OR early talent OR early careers";
+    const engQ = "software engineer OR software developer";
+    const rec = slug
+      ? `https://www.linkedin.com/company/${encodeURIComponent(slug)}/people/?keywords=${encodeURIComponent(recQ)}`
+      : liSearch("people", `"${name}" ("university recruiter" OR "campus recruiter" OR "early talent" OR "early careers")`);
+    const eng = slug
+      ? `https://www.linkedin.com/company/${encodeURIComponent(slug)}/people/?keywords=${encodeURIComponent(engQ)}`
+      : liSearch("people", `"${name}" ("software engineer" OR "software developer")`);
+    const company = slug
+      ? `https://www.linkedin.com/company/${encodeURIComponent(slug)}/`
+      : liSearch("companies", name);
+    return { rec, eng, company };
+  }
+
+  const REFRESH_MS = 10_000;
+  let canada = [], us = [];
+  let region = "ca", sortKey = "company", sortDir = 1;
+
+  function mergedRows() {
+    const map = new Map();
+    for (const r of canada) map.set(r.company.toLowerCase(), { ...r, where: "Canada" });
+    for (const r of us) {
+      const k = r.company.toLowerCase();
+      const hit = map.get(k);
+      if (hit) {
+        hit.where = "Canada + US";
+        hit.intern_count = Math.max(Number(hit.intern_count) || 0, Number(r.intern_count) || 0);
+        hit.california_count = Math.max(Number(hit.california_count) || 0, Number(r.california_count) || 0);
+        hit.priority = Math.max(Number(hit.priority) || 0, Number(r.priority) || 0);
+        hit.california = hit.california || r.california;
+        hit.open_now = hit.open_now || r.open_now;
+        hit.startup = hit.startup || r.startup;
+        hit.example_job = hit.example_job || r.example_job;
+        hit.example_link = hit.example_link || r.example_link;
+        if (r.applied === "yes") hit.applied = "yes";
+      } else map.set(k, { ...r, where: "US" });
+    }
+    return [...map.values()];
+  }
+
+  function isSmall(r) {
+    const n = Number(r.intern_count) || 0;
+    const blob = `${r.ats || ""} ${r.example_link || ""} ${r.careers_page || ""} ${r.ping_job_link || ""} ${r.ping_note || ""}`.toLowerCase();
+    const board = /ashby|rippling|lever\.co|greenhouse|ycombinator|breezy|wellfound|bamboohr|workable|gem\.com|jazzhr|applytojob/.test(blob);
+    return board || r.startup === "yes" || (r.open_now === "yes" && n <= 12);
+  }
+
+  function isBay(r) {
+    if (r.california === "yes" || Number(r.california_count) > 0) return true;
+    const blob = `${r.example_job || ""} ${r.where || ""} ${r.ping_note || ""} ${r.term || ""}`.toLowerCase();
+    return /san francisco|\bsf\b|bay area|palo alto|mountain view|sunnyvale|menlo park|san mateo|redwood/.test(blob);
+  }
+
+  function rowsFor() {
+    if (region === "canada") return canada.map((r) => ({ ...r, where: "Canada" }));
+    if (region === "us") return us.map((r) => ({ ...r, where: "US" }));
+    const all = mergedRows();
+    if (region === "small") return all.filter(isSmall);
+    if (region === "sf") return all.filter((r) => isSmall(r) && isBay(r));
+    if (region === "ca") {
+      return canada.map((r) => ({ ...r, where: "Canada" })).filter(isSmall);
+    }
+    return all;
+  }
+
+  function val(r, k) {
+    if (k === "priority" || k === "intern_count") return Number(r[k]) || 0;
+    return String(r[k] || "");
+  }
+
+  function whereLabel(r) {
+    const w = r.where || "";
+    if (w.includes("US") && (r.california === "yes" || Number(r.california_count) > 0)) {
+      return w.includes("CA") ? w : `${w} · CA`;
+    }
+    return w;
+  }
+
+  function render() {
+    const q = $("#q").value.trim().toLowerCase();
+    let shown = rowsFor().filter((r) => {
+      if (!q) return true;
+      const blob = `${r.company} ${r.example_job || ""} ${r.term || ""} ${r.ping_name || ""} ${r.ping_note || ""} ${r.where || ""}`.toLowerCase();
+      return blob.includes(q);
+    });
+    shown = shown.slice().sort((a, b) => {
+      const av = val(a, sortKey), bv = val(b, sortKey);
+      const primary = typeof av === "number" ? (av - bv) * sortDir : av.localeCompare(bv) * sortDir;
+      return primary || String(a.company || "").localeCompare(String(b.company || ""));
+    });
+    $("#rows").innerHTML = shown.map((r) => {
+      const p = peopleLinks(r);
+      const mail = r.contact
+        ? `<a href="mailto:${esc(r.contact)}">${esc(r.contact)}</a>`
+        : "";
+      const pingHref = r.ping_linkedin || (r.contact ? `mailto:${r.contact}` : "");
+      const ping = r.ping_name
+        ? (pingHref
+          ? `<a class="rec" href="${esc(pingHref)}" target="_blank" rel="noopener" title="${esc(r.ping_title || r.ping_note || "")}">${esc(r.ping_name)}</a>`
+          : `<span class="rec" title="${esc(r.ping_title || r.ping_note || "")}">${esc(r.ping_name)}</span>`)
+        : `<span class="m">—</span>`;
+      const job = r.ping_job_link
+        ? `<a href="${esc(r.ping_job_link)}" target="_blank" rel="noopener">Job</a>`
+        : "";
+      const applied = r.applied === "yes" ? `<span class="applied">applied</span>` : "";
+      return `<tr>
+        <td><a href="${esc(p.company)}" target="_blank" rel="noopener">${esc(r.company)}</a>${applied}</td>
+        <td class="m">${esc(whereLabel(r))}</td>
+        <td class="n">${r.intern_count || ""}</td>
+        <td class="people">${ping}</td>
+        <td class="people">
+          <a class="rec" href="${esc(p.rec)}" target="_blank" rel="noopener">Recruiters</a>
+          <a href="${esc(p.eng)}" target="_blank" rel="noopener">Engineers</a>
+          ${job}
+          ${mail}
+        </td>
+      </tr>`;
+    }).join("") || `<tr><td class="m" colspan="5">No companies</td></tr>`;
+    const n = rowsFor().length;
+    const label = region === "small"
+      ? "small ATS shops (Ashby / Rippling / Lever / BambooHR / open intern)"
+      : region === "sf" ? "SF / Bay Area small intern shops (Composio class)"
+      : region === "ca" ? "Canadian startups / small intern shops (FreshBooks class)"
+      : region === "all" ? "SWE intern employers (open or closed)"
+      : `${region === "us" ? "US" : "Canadian"} SWE intern employers`;
+    $("#sub").textContent = q
+      ? `${shown.length} of ${n} ${label}`
+      : `${n} ${label}. Search a name, then Recruiters.`;
+  }
+
+  async function load() {
+    const data = await fetch("/api/outreach", { cache: "no-store" }).then((r) => r.json()).catch(() => ({}));
+    canada = data.canada?.rows || [];
+    us = data.us?.rows || [];
+    render();
+  }
+
+  document.querySelectorAll("[data-region]").forEach((b) => b.addEventListener("click", () => {
+    document.querySelectorAll("[data-region]").forEach((t) => t.classList.toggle("on", t === b));
+    region = b.dataset.region;
+    render();
+    $("#q").focus();
+  }));
+  $("#q").addEventListener("input", render);
+  document.querySelector("table").addEventListener("click", (e) => {
+    const k = e.target.dataset.k;
+    if (!k) return;
+    sortDir = k === sortKey ? -sortDir : (k === "company" || k === "where" ? 1 : -1);
+    sortKey = k;
+    render();
+  });
+
+  load();
+  setInterval(load, REFRESH_MS);
+</script>
+</body>
+</html>

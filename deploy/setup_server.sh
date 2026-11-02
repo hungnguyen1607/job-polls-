@@ -22,7 +22,8 @@ cp -r deploy/systemd/* ~/.config/systemd/user/
 sudo loginctl enable-linger "$USER"   # keep services running with nobody logged in
 systemctl --user daemon-reload
 systemctl --user enable --now internship-feed \
-    internship-watch@big_ats internship-watch@bigtech internship-watch@canada internship-watch@small_ats
+    internship-watch@big_ats internship-watch@bigtech internship-watch@canada internship-watch@small_ats \
+    internship-watch@outreach
 
 sudo ufw allow OpenSSH >/dev/null
 sudo ufw allow 8787/tcp >/dev/null

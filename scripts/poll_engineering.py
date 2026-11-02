@@ -141,10 +141,16 @@ _US_STATES = (
     "texas|utah|vermont|virginia|washington|west virginia|wisconsin|wyoming|"
     "district of columbia"
 )
+# Ashby (and a few others) store metro as a short code: Composio intern reqs are "sf".
+_PLACE_CODES = {
+    "sf": "San Francisco, CA, United States",
+    "sfo": "San Francisco, CA, United States",
+}
+
 _US_CITIES = (
     "nyc|san francisco|seattle|austin|boston|chicago|los angeles|atlanta|denver|dallas|"
-    "houston|san jose|san diego|palo alto|mountain view|sunnyvale|menlo park|redmond|"
-    "bellevue|cambridge, ma|pittsburgh|philadelphia|phoenix|miami|raleigh|salt lake city|"
+    "houston, tx|san jose|san diego|palo alto|mountain view|sunnyvale|menlo park|redmond|"
+    "bellevue, wa|cambridge, ma|pittsburgh|philadelphia|phoenix|miami|raleigh|salt lake city|"
     "minneapolis|detroit|nashville|portland, or|brooklyn|manhattan|silicon valley|bay area"
 )
 US_TEXT_RE = re.compile(
@@ -167,6 +173,22 @@ CA_TEXT_RE = re.compile(
 )
 # Case-sensitive. NL/PE are skipped (Netherlands/Peru use them too).
 CA_CODE_RE = re.compile(r"^CA-|^CAN\b|\bCAN\b|, ?(ON|BC|QC|AB|MB|SK|NS|NB|PEI|YT|NT|NU)\b")
+# A location part ending in another country ("Laval, France", "Madrid, MD, ES") isn't US/Canada,
+# even if it contains a US/Canadian place name. Codes shared with US states (IN, DE, IL...) are left out.
+FOREIGN_COUNTRY_TAIL_RE = re.compile(
+    r",\s*(france|spain|espa[ñn]a|germany|deutschland|united kingdom|england|scotland|ireland|"
+    r"netherlands|portugal|italy|poland|switzerland|austria|belgium|sweden|denmark|norway|finland|"
+    r"czech(ia| republic)?|romania|india|china|japan|singapore|australia|brazil|mexico|philippines|"
+    r"israel|south africa|ES|FR|GB|UK|IE|NL|PT|IT|PL|CH|AT|BE|SE|DK|NO|FI|CZ|RO|CN|JP|SG|AU|BR|MX|PH)\s*$",
+    re.I,
+)
+# Some internal Workday location codes use a leading ISO country prefix before a region segment
+# that can collide with a US/CA code ("NZ-CAN-CHRISTCHURCH-115-1" -- "CAN" there is a New Zealand
+# region code, not Canada). If the part starts with one of these non-US/CA country prefixes,
+# trust that over any later token.
+FOREIGN_COUNTRY_HEAD_RE = re.compile(
+    r"^(NZ|AU|UK|GB|IE|FR|DE|ES|IT|NL|PT|PL|CH|AT|BE|SE|DK|NO|FI|CZ|RO|CN|JP|SG|BR|MX|PH|IN|IL|ZA)-",
+)
 
 
 def us_canada(location: str | None, country_iso: str | None = None) -> set[str]:
@@ -181,13 +203,20 @@ def us_canada(location: str | None, country_iso: str | None = None) -> set[str]:
             return set()  # structured country says somewhere else
     found: set[str] = set()
     for part in re.split(r"\s*[|;/]\s*|\n", location or ""):
-        part = part.strip()
-        if not part:
+        part = _PLACE_CODES.get(part.strip().lower(), part.strip())
+        if not part or FOREIGN_COUNTRY_TAIL_RE.search(part) or FOREIGN_COUNTRY_HEAD_RE.search(part):
             continue
-        if CA_CODE_RE.search(part) or CA_TEXT_RE.search(part):
+        us_part = part
+        if re.search(r"new brunswick,\s*(new jersey|NJ)\b", part, re.I):
+            found.add("US")
+        elif CA_CODE_RE.search(part) or CA_TEXT_RE.search(part):
             found.add("Canada")
+            # "Ottawa, ON, CA" or "Dorval, Québec, CA, H4S 1Y9": once a Canadian place is
+            # confirmed, every standalone "CA" token is the country code, not California,
+            # even when a postal code trails it.
+            us_part = re.sub(r",\s*CA\b", "", part)
         # "CA-AB-Calgary" is Canada; ", CA" (California) is US.
-        if US_CODE_RE.search(part) or US_TEXT_RE.search(part):
+        if US_CODE_RE.search(us_part) or US_TEXT_RE.search(us_part):
             if not part.startswith("CA-"):
                 found.add("US")
     return found

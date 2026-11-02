@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Application Tracker</title>
+<style>
+  :root { --muted: #6b7280; --line: #eee; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #fff; color: #111; font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 1200px; margin: 0 auto; padding: 32px 20px 64px; }
+  h1 { font-size: 20px; font-weight: 600; margin: 0 0 4px; }
+  nav { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
+  nav a { color: var(--muted); margin-right: 14px; }
+  .bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+  .tabs button { border: 1px solid #ddd; background: #fff; color: #111; }
+  .tabs button.on { border-color: #111; background: #111; color: #fff; }
+  button { border: 1px solid #111; background: #111; color: #fff; padding: 6px 14px; border-radius: 999px; cursor: pointer; font: inherit; font-size: 13px; white-space: nowrap; }
+  button:disabled { opacity: .4; cursor: default; }
+  input { flex: 1; min-width: 200px; border: 1px solid #ddd; border-radius: 8px; padding: 8px 12px; font: inherit; outline: none; }
+  input:focus { border-color: #111; }
+  #sync-info { color: var(--muted); font-size: 13px; }
+  #sync-info.err { color: #b91c1c; }
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; font-size: 12px; font-weight: 500; color: var(--muted); padding: 6px 8px 6px 0; border-bottom: 1px solid #ddd; cursor: pointer; user-select: none; white-space: nowrap; }
+  td { padding: 8px 8px 8px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+  td.m { color: var(--muted); font-size: 13px; white-space: nowrap; }
+  td.s { color: var(--muted); font-size: 13px; max-width: 340px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  td a { color: #111; }
+  select { font: inherit; font-size: 13px; border: 1px solid #ddd; border-radius: 6px; padding: 3px 6px; background: #fff; }
+  select.Applied { background: #f3f4f6; }
+  select.Action-needed { background: #fef3c7; }
+  select.Assessment { background: #e0e7ff; }
+  select.Interview { background: #dbeafe; }
+  select.Offer { background: #dcfce7; }
+  select.Rejected { background: #fee2e2; }
+  select.Withdrawn { background: #e5e7eb; color: var(--muted); }
+  .manual { color: var(--muted); font-size: 11px; margin-left: 4px; cursor: pointer; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Application Tracker</h1>
+  <nav><a href="/">← Internships</a><a href="/tailor">Tailor resume</a><a href="/outreach">Outreach tracker</a></nav>
+  <div class="bar tabs" id="tabs"></div>
+  <div class="bar">
+    <input id="q" type="search" placeholder="Search company or role">
+    <button id="sync">Sync email</button>
+    <span id="sync-info"></span>
+  </div>
+  <table>
+    <thead><tr>
+      <th data-k="company">Company / role</th>
+      <th data-k="status">Status</th>
+      <th data-k="applied">Applied</th>
+      <th data-k="updated">Last update</th>
+      <th data-k="last_subject">Latest email</th>
+      <th>Resume</th>
+    </tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+</main>
+<script>
+  const $ = (s) => document.querySelector(s);
+  const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  let data = { rows: [], statuses: [] }, filter = "All", sortKey = "updated", sortDir = -1;
+
+  function ago(iso) {
+    if (!iso) return "never";
+    const m = Math.max(0, Math.round((Date.now() - new Date(iso)) / 60000));
+    if (m < 1) return "just now";
+    if (m < 60) return `${m} min ago`;
+    const h = Math.round(m / 60);
+    return h < 24 ? `${h} hr ago` : `${Math.round(h / 24)} d ago`;
+  }
+
+  function post(url, body) {
+    return fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
+  }
+
+  function renderTabs() {
+    const counts = { All: data.rows.length };
+    for (const r of data.rows) counts[r.status] = (counts[r.status] || 0) + 1;
+    $("#tabs").innerHTML = ["All", ...data.statuses].map((s) =>
+      `<button class="${s === filter ? "on" : ""}" data-s="${esc(s)}">${esc(s)} ${counts[s] || 0}</button>`).join("");
+  }
+
+  function render() {
+    renderTabs();
+    const q = $("#q").value.trim().toLowerCase();
+    const rows = data.rows
+      .filter((r) => filter === "All" || r.status === filter)
+      .filter((r) => !q || `${r.company} ${r.role}`.toLowerCase().includes(q))
+      .sort((a, b) => String(a[sortKey]).localeCompare(String(b[sortKey])) * sortDir);
+    $("#rows").innerHTML = rows.map((r) => `
+      <tr>
+        <td>${r.link ? `<a href="${esc(r.link)}" target="_blank" rel="noopener">${esc(r.company)}</a>` : esc(r.company)}
+          <div class="m">${esc(r.role || "role unknown")}${r.location ? " · " + esc(r.location) : ""}</div></td>
+        <td class="m"><select class="${esc(r.status.replace(" ", "-"))}" data-key="${esc(r.key)}">
+          ${data.statuses.map((s) => `<option${s === r.status ? " selected" : ""}>${esc(s)}</option>`).join("")}
+        </select>${r.status !== r.auto_status ? `<span class="manual" data-key="${esc(r.key)}" title="Set by you; email says ${esc(r.auto_status)}. Click to reset.">manual ×</span>` : ""}</td>
+        <td class="m">${esc(r.applied)}</td>
+        <td class="m">${esc(r.updated)}</td>
+        <td class="s" title="${esc(r.last_snippet)}">${esc(r.last_subject)}${r.emails > 1 ? ` <span class="m">(${r.emails})</span>` : ""}</td>
+        <td>${r.resume ? `<a href="/resumes/${encodeURIComponent(r.resume)}" target="_blank">PDF</a>` : ""}</td>
+      </tr>`).join("") || `<tr><td class="m" colspan="6">No applications</td></tr>`;
+    renderSync();
+  }
+
+  function renderSync() {
+    const info = $("#sync-info");
+    info.classList.toggle("err", !!data.sync_error);
+    const added = data.last_added;
+    const extra = added > 0 ? ` · ${added} new` : "";
+    info.textContent = data.syncing ? "Syncing…"
+      : data.sync_error ? data.sync_error
+      : `Last synced ${ago(data.last_sync)}${extra} · auto every 15 min`;
+    $("#sync").disabled = !!data.syncing;
+  }
+
+  async function load() {
+    const next = await fetch("/api/tracker").then((r) => r.json()).catch(() => null);
+    if (next) data = next;
+    render();
+  }
+
+  $("#tabs").addEventListener("click", (e) => {
+    if (e.target.dataset.s) { filter = e.target.dataset.s; render(); }
+  });
+  $("#q").addEventListener("input", render);
+  document.querySelector("thead").addEventListener("click", (e) => {
+    const k = e.target.dataset.k;
+    if (!k) return;
+    sortDir = k === sortKey ? -sortDir : (k === "company" ? 1 : -1);
+    sortKey = k;
+    render();
+  });
+  $("#rows").addEventListener("change", async (e) => {
+    if (e.target.tagName !== "SELECT") return;
+    await post("/api/tracker/status", { key: e.target.dataset.key, status: e.target.value });
+    load();
+  });
+  $("#rows").addEventListener("click", async (e) => {
+    if (!e.target.classList.contains("manual")) return;
+    await post("/api/tracker/status", { key: e.target.dataset.key, status: null });
+    load();
+  });
+  $("#sync").addEventListener("click", async () => {
+    data.syncing = true;
+    data.sync_error = "";
+    renderSync();
+    let clickError = "";
+    try {
+      const res = await post("/api/tracker/sync");
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) clickError = body.error || `Sync failed (${res.status})`;
+    } catch (err) {
+      clickError = err.message || String(err);
+    }
+    await load();
+    if (clickError) {
+      data.sync_error = clickError;
+      renderSync();
+    }
+  });
+
+  load();
+  setInterval(load, 60000);
+  setInterval(renderSync, 15000);
+</script>
+</body>
+</html>

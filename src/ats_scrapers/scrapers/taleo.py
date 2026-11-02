@@ -32,7 +32,7 @@ import json
 import re
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, ClassVar
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 from ats_scrapers.exceptions import ScraperError
 from ats_scrapers.models import ATSType, Job
@@ -42,6 +42,8 @@ if TYPE_CHECKING:
     from ats_scrapers.fetch import Fetcher
 
 DETAIL_CONCURRENCY = 8
+MAX_PAGES = 50
+_NEXT_PAGE_RE = re.compile(r'href="([^"]*searchResults\?next[^"]*)"[^>]*class="jscroll-next"')
 
 # Each job is rendered as `<a class="viewJobLink" href="...rid=NN">Title</a>`.
 _JOB_LINK_RE = re.compile(
@@ -113,6 +115,18 @@ class TaleoScraper(BaseScraper):
         async with self.make_fetcher() as fetch:
             html_text = await fetch.get_text(url)
             jobs = self._parse_listing(html_text, base_url=url)
+            # The listing shows 10 jobs; a "next" link (same session) returns the next 10.
+            seen = {j.ats_id for j in jobs}
+            for _ in range(MAX_PAGES - 1):
+                nxt = _NEXT_PAGE_RE.search(html_text)
+                if not nxt:
+                    break
+                html_text = await fetch.get_text(urljoin(url, html.unescape(nxt.group(1))))
+                page = [j for j in self._parse_listing(html_text, base_url=url) if j.ats_id not in seen]
+                if not page:
+                    break
+                seen.update(j.ats_id for j in page)
+                jobs.extend(page)
             if self.include_descriptions and jobs:
                 sem = asyncio.Semaphore(DETAIL_CONCURRENCY)
                 await asyncio.gather(*(
@@ -257,11 +271,13 @@ def _location_from_jsonld(value: object) -> str | None:
         addr = c.get("address")
         if not isinstance(addr, dict):
             continue
-        parts = [
-            str(addr.get(k) or "").strip()
-            for k in ("addressLocality", "addressRegion", "addressCountry")
-            if addr.get(k)
-        ]
+        parts = []
+        for k in ("addressLocality", "addressRegion", "addressCountry"):
+            v = addr.get(k)
+            if isinstance(v, dict):  # {"@type": "Country", "name": "US"}
+                v = v.get("name")
+            if v:
+                parts.append(str(v).strip())
         joined = ", ".join(p for p in parts if p)
         if joined:
             return joined

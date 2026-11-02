@@ -16,7 +16,7 @@ from pathlib import Path
 
 OUT_DIR = Path(__file__).resolve().parent.parent / "engineering-ats"
 FILES = {"us": OUT_DIR / "US_internships.csv", "canada": OUT_DIR / "canada_internships.csv"}
-FIELDS = ("company", "title", "location", "posted_on", "posted", "found", "link")
+FIELDS = ("company", "title", "location", "posted_on", "posted", "found", "found_at", "link")
 TOKEN = os.environ.get("FEED_TOKEN", "")
 
 _cache: dict[str, object] = {"key": None, "body": b""}

@@ -150,3 +150,12 @@ engineering-ats/
 
 # company lists (local data)
 ats-companies/
+
+# Gmail sync state (message IDs)
+applications/.email_sync.json
+
+# personal files: resumes, transcript, research notes, contact details
+*.pdf
+reports/
+research_notes/
+scripts/outreach_contacts.py

@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tailor Resume</title>
+<style>
+  :root { --muted: #6b7280; --line: #eee; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #fff; color: #111; font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 960px; margin: 0 auto; padding: 32px 20px 64px; }
+  h1 { font-size: 20px; font-weight: 600; margin: 0 0 4px; }
+  h2 { font-size: 15px; font-weight: 600; margin: 32px 0 8px; }
+  nav { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
+  nav a { color: var(--muted); }
+  textarea, input { width: 100%; border: 1px solid #ddd; border-radius: 8px; padding: 10px 12px; font: inherit; outline: none; }
+  textarea { height: 260px; resize: vertical; }
+  textarea:focus, input:focus { border-color: #111; }
+  .row { display: flex; gap: 8px; margin-top: 8px; }
+  button { border: 1px solid #111; background: #111; color: #fff; padding: 8px 18px; border-radius: 999px; cursor: pointer; font: inherit; white-space: nowrap; }
+  button:disabled { opacity: .4; cursor: default; }
+  #status { color: var(--muted); font-size: 13px; margin-top: 12px; }
+  #out { white-space: pre-wrap; background: #fafafa; border: 1px solid var(--line); border-radius: 8px; padding: 12px; margin-top: 8px; max-height: 420px; overflow: auto; }
+  #pdf { display: inline-block; margin-top: 10px; font-weight: 500; color: #111; }
+  table { width: 100%; border-collapse: collapse; }
+  td { padding: 8px 8px 8px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+  td.m { color: var(--muted); font-size: 13px; white-space: nowrap; }
+  td a { color: #111; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Tailor Resume</h1>
+  <nav><a href="/">← Internships</a> · <a href="/tracker">Application tracker</a> · <a href="/outreach">Outreach tracker</a></nav>
+  <textarea id="jd" placeholder="Paste the full job description"></textarea>
+  <div class="row">
+    <input id="link" type="url" placeholder="Job link (optional)">
+    <button id="go">Tailor</button>
+  </div>
+  <div id="status"></div>
+  <div id="out" hidden></div>
+  <a id="pdf" target="_blank" hidden>Open tailored PDF</a>
+
+  <h2>Applications</h2>
+  <table><tbody id="apps"></tbody></table>
+</main>
+<script>
+  const $ = (s) => document.querySelector(s);
+  const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  const pdfUrl = (name) => "/resumes/" + encodeURIComponent(name);
+
+  async function loadApps() {
+    const rows = await fetch("/api/applications").then((r) => r.json()).catch(() => []);
+    $("#apps").innerHTML = rows.map((r) => `
+      <tr>
+        <td class="m">${esc(r.date.slice(0, 10))}</td>
+        <td>${r.link ? `<a href="${esc(r.link)}" target="_blank" rel="noopener">${esc(r.company)}</a>` : esc(r.company)}<div class="m">${esc(r.role)}</div></td>
+        <td class="m">${esc(r.status)}</td>
+        <td>${r.resume ? `<a href="${pdfUrl(r.resume)}" target="_blank">PDF</a>` : ""}</td>
+      </tr>`).join("");
+  }
+
+  function poll(id) {
+    const tick = async () => {
+      const job = await fetch(`/api/tailor/${id}`).then((r) => r.json());
+      $("#out").hidden = !job.output;
+      $("#out").textContent = job.output;
+      if (job.status === "running") {
+        $("#status").textContent = `Tailoring… ${job.elapsed}s (usually 1–3 min)`;
+        return setTimeout(tick, 2000);
+      }
+      $("#status").textContent = job.status === "done" ? `Done in ${job.elapsed}s` : "Failed — see output above";
+      if (job.pdf) Object.assign($("#pdf"), { href: pdfUrl(job.pdf), hidden: false, textContent: `Open ${job.pdf}` });
+      $("#go").disabled = false;
+      loadApps();
+    };
+    tick();
+  }
+
+  $("#go").addEventListener("click", async () => {
+    $("#go").disabled = true;
+    $("#pdf").hidden = true;
+    $("#status").textContent = "Starting…";
+    const res = await fetch("/api/tailor", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jd: $("#jd").value, link: $("#link").value }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      $("#status").textContent = data.error || `Error ${res.status}`;
+      $("#go").disabled = false;
+      return;
+    }
+    poll(data.id);
+  });
+
+  loadApps();
+</script>
+</body>
+</html>

@@ -31,6 +31,9 @@
 <main>
   <h1>Software Internships</h1>
   <div id="status">Loading…</div>
+  <a id="tailor" href="/tailor" hidden style="margin-bottom:16px; color:#111; font-size:13px;">Tailor resume →</a>
+  <a id="tracker" href="/tracker" hidden style="margin:0 0 16px 16px; color:#111; font-size:13px;">Application tracker →</a>
+  <a id="outreach" href="/outreach" hidden style="margin:0 0 16px 16px; color:#111; font-size:13px;">Outreach tracker →</a>
   <div class="bar">
     <button class="tab on" data-region="us">US</button>
     <button class="tab" data-region="canada">Canada</button>
@@ -45,21 +48,33 @@
   const $ = (s) => document.querySelector(s);
   const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
+  const secsSince = (iso) => (Date.now() - new Date(iso)) / 1000;
+  function ago(secs) {
+    if (!(secs >= 0) || secs < 60) return "just now";
+    if (secs < 3600) return `${Math.floor(secs / 60)} min ago`;
+    if (secs < 86400) return `${Math.floor(secs / 3600)} h ago`;
+    const d = Math.floor(secs / 86400);
+    return d === 1 ? "1 day ago" : `${d} days ago`;
+  }
+
   function render() {
     if (!feed) return;
     const q = $("#q").value.trim().toLowerCase();
     const rows = (feed[region] || []).filter((r) =>
       !q || `${r.company} ${r.title} ${r.location}`.toLowerCase().includes(q));
-    $("#list").innerHTML = rows.map((r) => `
+    $("#list").innerHTML = rows.map((r) => {
+      const found = r.found_at ? secsSince(r.found_at) : null;
+      const isNew = found !== null ? found < 3600 : /min ago|just now/.test(r.found);
+      return `
       <li>
-        <div>${/min ago/.test(r.found) ? '<span class="new" title="Found in the last hour"></span>' : ""}<a href="${esc(r.link)}" target="_blank" rel="noopener">${esc(r.title)}</a> <span class="co">· ${esc(r.company)}</span></div>
-        <div class="when">${esc(r.posted)}</div>
+        <div>${isNew ? '<span class="new" title="Found in the last hour"></span>' : ""}<a href="${esc(r.link)}" target="_blank" rel="noopener">${esc(r.title)}</a> <span class="co">· ${esc(r.company)}</span></div>
+        <div class="when" title="${esc(r.posted_on)}">${/^(first seen|unknown)/.test(r.posted) ? "posted date unknown" : `posted ${esc(r.posted)}`}</div>
         <div class="loc">${esc(r.location)}</div>
-        <div class="when">${esc(r.posted_on)}</div>
-      </li>`).join("");
+        <div class="when">found ${found !== null ? ago(found) : esc(r.found)}</div>
+      </li>`;
+    }).join("");
     $("#empty").hidden = rows.length > 0;
-    const mins = Math.round((Date.now() - new Date(feed.updated)) / 60000);
-    $("#status").textContent = `${rows.length} internships · updated ${mins <= 0 ? "just now" : `${mins} min ago`}`;
+    $("#status").textContent = `${rows.length} internships · updated ${ago(secsSince(feed.updated))}`;
   }
 
   async function load() {
@@ -79,6 +94,7 @@
     render();
   }));
   $("#q").addEventListener("input", render);
+  if (["localhost", "127.0.0.1"].includes(location.hostname)) $("#tailor").hidden = $("#tracker").hidden = $("#outreach").hidden = false;
   load();
   setInterval(load, REFRESH_MS);
   setInterval(render, 30_000);

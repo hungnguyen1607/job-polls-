@@ -28,6 +28,7 @@ import asyncio
 import contextlib
 import csv
 import contextvars
+import fcntl
 import importlib.util
 import json
 import os
@@ -56,6 +57,21 @@ _poll = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_poll)
 us_canada = _poll.us_canada
 
+_DEDUP_STOPWORDS = re.compile(
+    r"\b(inc|ltd|llc|corp|corporation|company|co|the|mutual|insurance|technologies|group|holdings)\b")
+
+
+def dedup_key(name: str) -> str:
+    """Normalizes a company name past accents, Canada/CA suffixes, and generic corporate
+    stopwords so name variants of the same company collapse together (e.g. 'CGI Group Inc.' and
+    'CGI', or 'Capital One - CA' and 'Capital One'). Used to join across data sources that each
+    spell a company name slightly differently."""
+    import unicodedata
+    n = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode().lower()
+    n = re.sub(r"[\s_-]+(ca|canada)\b", "", n)
+    n = _DEDUP_STOPWORDS.sub("", n)
+    return re.sub(r"[^a-z0-9]+", "", n)
+
 OUT_DIR = REPO / "engineering-ats"
 US_CSV_PATH = OUT_DIR / "US_internships.csv"
 CA_CSV_PATH = OUT_DIR / "canada_internships.csv"
@@ -68,7 +84,8 @@ MIN = 60
 
 # Sources that are a whole site (not a list of companies in ats-companies/).
 SINGLE_SOURCES = {"cgi", "shopify", "janestreet", "linkedin", "careers_search", "discover", "bytedance", "google", "amazon", "apple", "meta", "tiktok", "uber", "tesla",
-                  "jobbankca", "builtin", "ycombinator", "wellfound", "remoterocketship", "workopolis", "eluta"}
+                  "jobbankca", "builtin", "ycombinator", "wellfound", "remoterocketship", "workopolis", "eluta",
+                  "simplifyjobs"}
 LIST_SOURCES = {
     "simplify": "https://raw.githubusercontent.com/SimplifyJobs/Summer2027-Internships/dev/.github/scripts/listings.json",
     "vanshb03": "https://raw.githubusercontent.com/vanshb03/Summer2027-Internships/dev/.github/scripts/listings.json",
@@ -88,41 +105,65 @@ CONCURRENCY = {"workday": 32, "greenhouse": 24, "lever": 24, "ashby": 24, "smart
                "eightfold": 2,  # see MIN_GAP
                "canada": 32}  # mixed hosts; each source inside it keeps its own cap (run_pass)
 DEFAULT_CONCURRENCY = 16
+# Sources whose targets are {src, company_key, name, row} boards from several ATSes.
+MIXED_SOURCES = {"canada"}
 # Companies per child process. Heavy scrapers get smaller batches so a process never
 # reaches the memory cap (SuccessFactors pages are large).
-BATCH_SIZE = {"successfactors": 100, "lever": 250, "careers": 200, "canada": 420}
+BATCH_SIZE = {"successfactors": 100, "lever": 250, "careers": 200, "canada": 210}  # canada: 420 kept dying at 2 GB
 # Batch processes run side by side for these sources (others run one batch at a time).
 # Careers: 3 at once; 8 (each rendering pages in Chrome) pushed load past 100 on 16 cores
 # and starved the other sources (ADP / Paycom passes hit the 45-min cap, 2026-10-08).
 # Canada: all ~4 batches at once (API calls, little rendering) so a round takes ~3-4 min, not ~13.
-PARALLEL_BATCHES = {"careers": 3, "canada": 4}
+PARALLEL_BATCHES = {"careers": 3, "canada": 4,
+                    # Light API batches (~200 MB each): side by side so one slow batch (dead boards
+                    # read through careers pages) doesn't hold up the rest of the list.
+                    # Workday at 2 made each batch ~2x slower (more timeouts): no gain.
+                    "greenhouse": 3}
+# Eightfold's AWS WAF blocks the IP after a burst of requests, and paging through a big
+# tenant's full list (Microsoft: ~240 pages) is that burst. Searching the INTERN_RE words
+# instead takes a few pages per tenant.
+EIGHTFOLD_QUERIES = ["intern", "co-op", "student", "stagiaire", "stage", "apprentice", "werkstudent"]
 CAREERS_PAGE_CAP = 90  # seconds per careers page: fetch, maybe render, read linked boards
 # A few SuccessFactors tenants are huge on their own; give that source more headroom
 # (only one of its processes runs at a time).
-MEM_CAP_MB = {"successfactors": 3000}
-SLOW_DELAY = {"workable": 1.0}  # seconds between companies
-NEEDS_DETAIL = {"taleo"}  # listings carry no location without the detail page
+MEM_CAP_MB = {"successfactors": 3000, "canada": 3500}
+# seconds between companies; Eightfold's AWS WAF blocked 54/85 tenants when polled back to back
+SLOW_DELAY = {"workable": 1.0, "eightfold": 3.0}
+# Sources whose every job needs its detail page. Taleo listings carry no location either, but
+# check_scraper fetches details only for the software-internship titles that lack one.
+NEEDS_DETAIL: set[str] = set()
 
 
 # --- filter -----------------------------------------------------------------------
 
 INTERN_RE = re.compile(
     r"\b(intern|interns|internship|internships|co-?op|coop|stagiaire|apprentice(ship)?|"
-    r"summer (student|associate|analyst)|working student|werkstudent|student|stagiaires?|stagaires?)\b"
-    r"|^\s*stage\b|\bstage\s*[:\-–]",
+    r"summer (student|associate|analyst)|working student|werkstudent|student|stagiaires?|stagaires?|"
+    r"stages?)\b",
     re.I,
+)
+# Catch-all intern application forms (Genetec: "Applications for winter internship") —
+# software is one of the tracks; the title names no other function.
+GENERIC_INTERN_APP_RE = re.compile(
+    r"(?ix)"
+    r"applications?\s+(pour\s+(les\s+)?stages?|for\s+.{0,60}?(internship|interns?\b|co-?ops?))"
+    r"|internship\s+applications?\b"
+    r"|programme\s+de\s+stages?"
+    r"|candidatures?\s+(pour|aux?)\s+(les\s+)?stages?"
 )
 # A: the role must be software-side (user-confirmed: no mechanical/civil/etc.).
 ROLE_RE = re.compile(
     # Strong on their own: clearly software / engineering / IT roles.
-    r"(?i:\b(software|swe|sde|sdet|developer|programmer|programming language\w*|coder|full[- ]?stack|"
+    r"(?i:\b(software|swe|sde|sdet|developer|programmer|programming language\w*|coder|full[- ]?stack|fullstack|"
     r"front[- ]?end|back[- ]?end|frontend|backend|devops|devsecops|mlops|sre|site reliability|"
-    r"d[eé]veloppe(ur|use)\w*|information technology|"
+    r"d[eé]veloppe(ur|use)\w*|programmeur\w*|programmation|informaticien\w*|"
+    r"information technology|"
     r"computer science|computer engineering|machine learning|deep learning|"
     r"artificial intelligence|intelligence artificielle|cyber\s?security|cyber|cybers[eé]curit[eé]|"
     r"information security|infosec|donn[eé]es|r[eé]seaux?|infonuagique|network services|"
     r"intelligence d.affaires|business intelligence|"
-    r"robotics software|firmware|embedded)\b"
+    r"robotics software|firmware|embedded|member of technical staff|"
+    r"forward[- ]?deployed|engineering internships?)\b"
     # Broad words only count in a software / engineering context.
     r"|\b((software|data|ml|ai|machine learning|platform|cloud|infrastructure|systems?|"
     r"network\w*|security|cyber\w*|devops|reliability|backend|back[- ]?end|frontend|front[- ]?end|"
@@ -132,6 +173,8 @@ ROLE_RE = re.compile(
     r"engineer\w* \w+ (software|data|ml|ai|cloud|platform|infrastructure|security)|"
     r"(computer|software|electrical (and|&) computer) engineering|"
     r"data (scien\w*|engineer\w*|analy\w*|infrastructure|platform)|"
+    r"data\s*(?:&|and)\s*(analytics|analysis|operational)|"
+    r"\banalytics?\b|analytic\w* financial engineering|financial engineering|"
     r"(software|web|mobile|app\w*|game|full[- ]?stack|front[- ]?end|back[- ]?end|"
     r"platform|systems) development|logiciel|informatique|"
     r"(qa|quality assurance|test|testing) (automation|engineer\w*|analyst|developer)|"
@@ -139,19 +182,20 @@ ROLE_RE = re.compile(
     r"(network|system|systems|database|cloud|it) (administrat\w*|admin|analyst|support|operations)|"
     r"cloud (computing|infrastructure|solutions?)|security (analyst|operations|research)|"
     r"(mobile|ios|android|web) (app\w*|developer|development)|technology analyst)\b)"
-    r"|\b(IT|AI|ML|LLM|NLP|SW)\b|\bS/W\b"  # case-sensitive: "IT" not "it", "SW" = software
+    r"|\b(IT|TI|AI|ML|LLM|NLP|SW)\b|\bS/W\b"  # TI = French IT; "IT"/"SW" not "it"
 )
 SOFTWARE_SIDE_RE = re.compile(
     r"(?i:\b(software|firmware|embedded|data|machine learning|devops|cloud|computer|"
     r"programm\w*|developer|full[- ]?stack|web|mobile|cyber\w*|network|site reliability|sre|"
-    r"qa|quality assurance analyst|test automation|information technology)\b)|\b(IT|AI|ML|SW)\b|\bS/W\b"
+    r"qa|quality assurance analyst|test automation|information technology|"
+    r"programmeur\w*|informaticien\w*)\b)|\b(IT|TI|AI|ML|SW)\b|\bS/W\b"
 )
 NON_SOFTWARE_RE = re.compile(
     r"\b(mechanical|civil|chemical|structural|manufacturing|industrial|process|electrical|"
     r"hardware|aerospace|materials?|nuclear|biomedical|environmental|geotechnical|hvac|"
     r"construction|mining|petroleum|packaging|plant|facilities|maintenance|field service|"
     r"rf|optical|mechatronics|power systems?|quality|operations|sustainability|tooling|"
-    r"equipment|transmission|asset|production|controls?|automation & controls|design verification|"
+    r"equipment|transmission|asset|production(?! systems)|controls?|automation & controls|design verification|"
     r"digital design|asic|silicon|analog|pcb|layout|validation|reliability|safety|"
     r"customer|field|sales|applications? engineer|industriel\w*|pratiques|facility|"
     r"building|energy|utility|utilities|substation|distribution|water|wastewater|"
@@ -170,22 +214,83 @@ NOT_TECH_ROLE_RE = re.compile(
 )
 # Titles that are software roles no matter what else they mention ("Financial Software Engineer").
 CLEARLY_SOFTWARE_RE = re.compile(
-    r"\b(software|developer|programmer|swe|sde|sdet|full[- ]?stack|devops|firmware|embedded|"
+    r"\b(software|developer|programmer|programmeur\w*|swe|sde|sdet|full[- ]?stack|devops|firmware|embedded|"
     r"machine learning|data scien\w*|data engineer\w*|ml engineer\w*|ai engineer\w*|"
+    r"data\s*(?:&|and)\s*analytics|financial engineering|"
     r"front[- ]?end|back[- ]?end|frontend|backend)\b",
     re.I,
 )
+
+# ATS display names that should show as the company people actually search for.
+_OUTREACH_NAME = {
+    "bankofnovascotiap": "Scotiabank",
+    "thebankofnovascotiap": "Scotiabank",
+    "thebankofnovascotia": "Scotiabank",
+    "bankofnovascotia": "Scotiabank",
+    "scotiaglobalassetmanagement": "Scotiabank",
+    "geotabinternships": "Geotab",
+    "uber": "Uber",
+    "intactfc": "Intact",
+    "intactfinancial": "Intact",
+    "intactfinancialcorporation": "Intact",
+}
+_BOARD_SUFFIX = re.compile(
+    r"[\s(]+(internships?|campus|students?|university|careers|early careers?|"
+    r"privileged|confidential)[)\s]*$",
+    re.I,
+)
+
+
+def outreach_company_name(name: str) -> str:
+    """'Geotab Internships' / 'The Bank of Nova Scotia P' → the name you'd search."""
+    k = dedup_key(name)
+    if k in _OUTREACH_NAME:
+        return _OUTREACH_NAME[k]
+    cleaned = _BOARD_SUFFIX.sub("", name).strip() or name
+    ck = dedup_key(cleaned)
+    if ck in _OUTREACH_NAME:
+        return _OUTREACH_NAME[ck]
+    return cleaned if ck and ck != k else name
+
+
 REMOTE_ONLY_RE = re.compile(r"^\W*(fully |100% )?(remote|anywhere|virtual|work from home|wfh)"
                             r"(\W+(remote|hybrid|flexible|first|friendly))*\W*$", re.I)
 
 
 def location_label(location: str | None, country_iso: str | None = None) -> str | None:
     """Return the location to show, or None when the job isn't in the US/Canada."""
+    if location:
+        location = _poll._PLACE_CODES.get(location.strip().lower(), location)
     if us_canada(location, country_iso):
         return location or {"US": "United States", "CA": "Canada"}.get((country_iso or "").upper(), "")
     if not country_iso and location and REMOTE_ONLY_RE.match(location.strip()):
         return f"{location.strip()} (country unclear)"
     return None
+
+
+_SOFTWARE_EMPLOYER: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "software_employer", default=False)
+_DROPPED_INTERNS: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar(
+    "dropped_interns", default=None)
+_CA_SOFTWARE_KEYS: set[str] | None = None
+
+
+def _is_ca_software_company(company: str) -> bool:
+    """True when this name is on canada_software_companies.csv (hires SWE in Canada)."""
+    global _CA_SOFTWARE_KEYS
+    if not company:
+        return False
+    if _CA_SOFTWARE_KEYS is None:
+        keys: set[str] = set()
+        path = OUT_DIR / "canada_software_companies.csv"
+        if path.exists():
+            with path.open(newline="", encoding="utf-8") as fh:
+                for row in csv.DictReader(fh):
+                    k = dedup_key(outreach_company_name(row.get("company") or ""))
+                    if k:
+                        keys.add(k)
+        _CA_SOFTWARE_KEYS = keys
+    return dedup_key(outreach_company_name(company)) in _CA_SOFTWARE_KEYS
 
 
 def _software_title(title: str) -> bool:
@@ -198,10 +303,28 @@ def _software_title(title: str) -> bool:
     return True
 
 
-def is_software_internship(title: str) -> bool:
-    """Title has an internship word AND a software-side role word (see ROLE_RE)."""
+def is_software_internship(title: str, software_employer: bool | None = None) -> bool:
+    """Title has an internship word AND a software-side role word (see ROLE_RE).
+
+    On a Canadian software employer's board, an intern/co-op/stage title that
+    doesn't name a non-tech function still counts (Genetec's "Applications for
+    winter internship"; "Co-op Student - Winter 2027").
+    """
     title = (title or "").replace("\xa0", " ").strip()
-    return bool(INTERN_RE.search(title)) and _software_title(title)
+    if not INTERN_RE.search(title):
+        return False
+    if _software_title(title):
+        return True
+    if NOT_TECH_ROLE_RE.search(title) and not CLEARLY_SOFTWARE_RE.search(title):
+        return False
+    if GENERIC_INTERN_APP_RE.search(title):
+        return True
+    employer = _SOFTWARE_EMPLOYER.get() if software_employer is None else software_employer
+    if employer:
+        if NON_SOFTWARE_RE.search(title) and not SOFTWARE_SIDE_RE.search(title):
+            return False
+        return True
+    return False
 
 
 def is_software_fulltime(title: str) -> bool:
@@ -228,9 +351,55 @@ def note_ca_software(title: str | None, location: str | None, country_iso: str |
 
 
 def keep(title: str, location: str | None, country_iso: str | None = None) -> str | None:
-    if not is_software_internship(title):
+    intern = bool(INTERN_RE.search((title or "").replace("\xa0", " ").strip()))
+    ok = is_software_internship(title)
+    if intern and not ok:
+        dropped = _DROPPED_INTERNS.get()
+        if dropped is not None and len(dropped) < 40:
+            dropped.append((title or "").strip()[:90])
+    if not ok:
         return None
     return location_label(location, country_iso)
+
+
+# Remote intern postings with no country. Shopify's Winter 2027 intern is the case that
+# used to get dropped; SpaceX / Ancestry / etc. are US firms that leaked in the other way.
+_CANADA_OUTREACH_SEED = {"shopify"}
+# Province/country tokens — not city names that also exist in the US (Vancouver WA, Waterloo IA).
+_CA_COUNTRY_OR_PROVINCE = re.compile(
+    r"\b(canada|canadian|ontario|qu[eé]bec|british columbia|alberta|manitoba|"
+    r"saskatchewan|nova scotia|new brunswick|newfoundland|prince edward island|"
+    r"yukon|nunavut|northwest territories)\b",
+    re.I,
+)
+
+
+def canada_for_outreach(location: str | None, title: str = "", url: str = "",
+                        company: str = "") -> bool:
+    """True when an intern posting should count as Canadian for the Canada outreach list.
+
+    Needs a real Canadian place (or 'Canada' in the title/URL), not merely Remote with
+    no country. Vancouver, WA and Waterloo, IA are US. Remote-unclear only counts for
+    known Canadian software employers (Shopify intern postings are often country-silent).
+    """
+    loc = location or ""
+    blob = f"{title} {url} {loc}"
+    if re.search(r"\bcanada\b", blob, re.I):
+        return True
+    countries = us_canada(loc)
+    if countries == {"Canada"}:
+        return True
+    if "Canada" in countries and "US" in countries:
+        # Shared city names tagged both countries. Keep only with a province/country token.
+        return bool(_CA_COUNTRY_OR_PROVINCE.search(loc) or _poll.CA_CODE_RE.search(loc))
+    unclear = (not loc) or loc.strip().lower() in {"location not listed"} or "country unclear" in loc.lower()
+    if not unclear:
+        return False
+    if any(_FOREIGN_PLACE.search(s) or _poll.FOREIGN_COUNTRY_TAIL_RE.search(s)
+           for s in (loc, title) if s):
+        return False
+    key = dedup_key(outreach_company_name(company)) if company else ""
+    return key in _CANADA_OUTREACH_SEED or _is_ca_software_company(company)
 
 
 # --- posting age --------------------------------------------------------------------
@@ -421,7 +590,13 @@ def norm_text(text: str) -> str:
     return re.sub(r"[^a-z0-9]", "", _COMPANY_SUFFIX.sub("", (text or "").lower()))
 
 
-LIST_ORIGINS = set(LIST_SOURCES) | {"linkedin", "remoterocketship", "workopolis", "eluta", "jobbankca"}  # ATS rows win duplicates
+def company_key(name: str) -> str:
+    """Company for duplicate matching, ignoring division suffixes: the careers page says
+    "Light & Wonder - iGaming" while LinkedIn says "Light & Wonder" for the same req."""
+    return norm_text(re.split(r"\s+[-–|(]\s*", name or "")[0]) or norm_text(name)
+
+
+LIST_ORIGINS = set(LIST_SOURCES) | {"linkedin", "remoterocketship", "workopolis", "eluta", "jobbankca", "builtin", "simplifyjobs"}  # ATS rows win duplicates
 
 
 def _city_key(location: str | None) -> str:
@@ -439,7 +614,7 @@ def _write(path: Path, rows: list[tuple]) -> None:
     tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     with tmp.open("w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
-        w.writerow(["company", "title", "location", "posted_on", "posted", "found", "link", "source"])
+        w.writerow(["company", "title", "location", "posted_on", "posted", "found", "link", "source", "found_at"])
         for when, company, title, location, posted_at, posted_text, first_seen, url, origin in rows:
             if when is None:
                 posted_on, posted = "", "unknown (open before watcher started)"
@@ -450,7 +625,7 @@ def _write(path: Path, rows: list[tuple]) -> None:
                 posted = age_text(posted_at, first_seen, posted_text)
             # When this poller first saw the posting (exact even when the source only gives a date).
             found = ago((datetime.now(UTC) - datetime.fromisoformat(first_seen)).total_seconds())
-            w.writerow([company, title, location, posted_on, posted, found, url, origin])
+            w.writerow([company, title, location, posted_on, posted, found, url, origin, first_seen])
     tmp.replace(path)
 
 
@@ -480,14 +655,54 @@ def sort_time(row: tuple) -> datetime:
     return when or datetime.min.replace(tzinfo=UTC)
 
 
+def _clamp_posted(row: tuple) -> tuple:
+    """A posting can't be newer than the moment we first saw it. Aggregators (InternDock) and
+    Workday re-date refreshed listings ("Posted Today" again), which floated week-old ones to the top."""
+    posted_at, posted_text, first_seen = row[3], row[4], row[5]
+    if not posted_at:
+        return row
+    when, seen = datetime.fromisoformat(posted_at), datetime.fromisoformat(first_seen)
+    too_new = (when.astimezone(UTC).date() > seen.astimezone(UTC).date() if _date_only(when, posted_text)
+               else when > seen)
+    return (*row[:3], first_seen, None, *row[5:]) if too_new else row
+
+
+_CSV_LOCK_PATH = None  # set lazily so OUT_DIR exists first
+
+
+def _csv_lock_path() -> Path:
+    global _CSV_LOCK_PATH
+    if _CSV_LOCK_PATH is None:
+        OUT_DIR.mkdir(exist_ok=True)
+        _CSV_LOCK_PATH = OUT_DIR / ".write_csv.lock"
+    return _CSV_LOCK_PATH
+
+
 def write_csv() -> int:
     """US_internships.csv and canada_internships.csv = software internships posted in the last
-    WINDOW_DAYS, newest first. Returns how many internships are in either file."""
+    WINDOW_DAYS, newest first. Returns how many internships are in either file.
+
+    Four separate watch_*.py processes all call this on their own schedules and write the same
+    files; without a cross-process lock, a call that started reading before a fresh posting was
+    committed can still finish (and overwrite the files) after a call that saw that posting,
+    silently dropping it until the next pass. An flock here serializes every read+write so each
+    call's view of the DB is always at least as fresh as the one before it."""
+    with open(_csv_lock_path(), "w") as lock_fh:
+        fcntl.flock(lock_fh, fcntl.LOCK_EX)
+        try:
+            n = _write_csv_locked()
+        finally:
+            fcntl.flock(lock_fh, fcntl.LOCK_UN)
+    return n
+
+
+def _write_csv_locked() -> int:
     db = connect()
     rows = db.execute("""SELECT company, title, location, posted_at, posted_text, first_seen, url,
                                 origin, baseline
                          FROM postings WHERE open=1""").fetchall()
     db.close()
+    rows = [_clamp_posted(r) for r in rows]
     dated: dict[tuple[str, str, str], str] = {}
     for r in rows:
         if r[3]:
@@ -504,17 +719,40 @@ def write_csv() -> int:
     #    same title): keep the newest, so a fresh posting is never hidden behind an old one
     #    (Dow Jones reposts each intern role; EA posts identical titles as separate reqs).
     rows = sorted(by_url.values(), key=lambda r: -datetime.fromisoformat(r[3] or r[5]).timestamp())
+
+    def job_key_of(r: tuple) -> tuple[str, str, str]:
+        # Same title in another city is another internship (DRW's Montreal and Chicago
+        # "Software Developer Intern"), so the city is part of the key.
+        return company_key(r[0]), norm_text(r[1]), _city_key(r[2])
+
+    # A list/LinkedIn row and an ATS row for the same job: show the ATS row (direct apply link,
+    # real posting date) even when the list's date sorts it first. Not when the ATS row is much
+    # older: then the list row is a repost, and reposts should still show as fresh.
+    ats_by_job: dict[tuple[str, str, str], tuple] = {}
+    for r in rows:
+        if r[7] not in LIST_ORIGINS:
+            ats_by_job.setdefault(job_key_of(r), r)
+
+    def ats_twin(r: tuple) -> tuple:
+        twin = ats_by_job.get(job_key_of(r))
+        if not twin:
+            return r
+        twin_when = datetime.fromisoformat(twin[3] or twin[5])
+        gap = datetime.fromisoformat(r[3] or r[5]) - twin_when
+        # Never let the swap push a job out of the window earlier than its list row would.
+        return twin if gap <= timedelta(days=2) and twin_when >= cutoff else r
     seen_urls: set[str] = set()
-    seen_jobs: set[tuple[str, str]] = set()
+    seen_jobs: set[tuple[str, str, str]] = set()
     cutoff = datetime.now(UTC) - timedelta(days=WINDOW_DAYS)
     out = []
     all_rows = []
-    for company, title, location, posted_at, posted_text, first_seen, url, origin, baseline in rows:
+    for r in rows:
+        if r[7] in LIST_ORIGINS:
+            r = ats_twin(r)
+        company, title, location, posted_at, posted_text, first_seen, url, origin, baseline = r
         if not is_software_internship(title):
             continue
-        # Same title in another city is another internship (DRW's Montreal and Chicago
-        # "Software Developer Intern"), so the city is part of the key.
-        url_key, job_key = norm_url(url), (norm_text(company), norm_text(title), _city_key(location))
+        url_key, job_key = norm_url(url), job_key_of(r)
         if url_key in seen_urls or job_key in seen_jobs:
             continue
         seen_urls.add(url_key)
@@ -533,9 +771,12 @@ def write_csv() -> int:
         out.append((when, company, title, location, posted_at, posted_text, first_seen, url, origin))
     out.sort(key=lambda r: (posted_day(r), sort_time(r)), reverse=True)  # newest day at the top
     countries = [us_canada(r[3]) for r in out]
-    # A posting with no clear country ("location not listed", "Remote (country unclear)") goes in both.
-    _write(US_CSV_PATH, [r for r, c in zip(out, countries) if "US" in c or not c])
-    _write(CA_CSV_PATH, [r for r, c in zip(out, countries) if "Canada" in c or not c])
+    # A posting with no clear country ("location not listed", "Remote (country unclear)") goes in both,
+    # unless its location or title names a place abroad.
+    unclear = [not c and not any(_FOREIGN_PLACE.search(s) or _poll.FOREIGN_COUNTRY_TAIL_RE.search(s)
+                                 for s in (r[3], r[2])) for r, c in zip(out, countries)]
+    _write(US_CSV_PATH, [r for r, c, u in zip(out, countries, unclear) if "US" in c or u])
+    _write(CA_CSV_PATH, [r for r, c, u in zip(out, countries, unclear) if "Canada" in c or u])
     # Every open internship, newest first; undated ones (age unknown) at the bottom.
     all_rows.sort(key=lambda r: (r[0] is not None, posted_day(r) if r[0] else date.min, sort_time(r)),
                   reverse=True)
@@ -657,12 +898,440 @@ INTERN_HISTORY_LISTS = {  # last season's lists keep every posting, closed ones 
     "simplify2026": "https://raw.githubusercontent.com/SimplifyJobs/Summer2026-Internships/dev/.github/scripts/listings.json",
     "vanshb03_2026": "https://raw.githubusercontent.com/vanshb03/Summer2026-Internships/dev/.github/scripts/listings.json",
 }
+# Canada-focused intern lists (markdown / jobs.json). Same companies the live pollers
+# already read; history ingest keeps closed Winter/Fall co-ops on outreach.
+CANADA_INTERN_HISTORY_LISTS = {
+    "negarprh": "https://raw.githubusercontent.com/negarprh/Canadian-Tech-Internships-2027/main/README.md",
+    "negarprh_2026": "https://raw.githubusercontent.com/negarprh/Canadian-Tech-Internships-2026/main/README.md",
+    "hansonchen": "https://raw.githubusercontent.com/HansonChen06/canada-tech-internships/main/data/jobs.json",
+}
 INTERN_HISTORY_REFRESH = 24 * 60 * 60  # seconds
+# Canadian SWE intern employers Waterloo/Concordia kids actually work at that public intern
+# lists (Simplify, negarprh) miss — they hire through WaterlooWorks / their own board.
+# Location is real; title is the role type, not a specific posting. No invented term/year.
+KNOWN_CA_INTERN_EMPLOYERS = [
+    ("Payfacto", "Software intern / co-op", "Montreal, Quebec, Canada",
+     "https://payfacto.bamboohr.com/careers"),
+    ("Nuvei", "Software intern / co-op", "Montreal, Quebec, Canada",
+     "https://apply.workable.com/nuvei"),
+    ("Lightspeed", "Software intern / co-op", "Montreal, Quebec, Canada",
+     "https://lightspeed.bamboohr.com/careers"),
+    ("Hopper", "Software intern / co-op", "Montreal, Quebec, Canada",
+     "https://jobs.ashbyhq.com/hopper"),
+    ("Plusgrade", "Software intern / co-op", "Montreal, Quebec, Canada",
+     "https://jobs.lever.co/plusgrade"),
+    ("Coveo", "Software intern / co-op", "Quebec City, Quebec, Canada",
+     "https://job-boards.greenhouse.io/coveoen"),
+    ("Genetec", "Software intern / co-op", "Montreal, Quebec, Canada",
+     "https://apply.workable.com/genetec-inc"),
+    ("Busbud", "Software intern / co-op", "Montreal, Quebec, Canada",
+     "https://busbud.bamboohr.com/careers"),
+    ("FreshBooks", "Software intern / co-op", "Toronto, Ontario, Canada",
+     "https://freshbooks.bamboohr.com/careers"),
+    ("Wealthsimple", "Software intern / co-op", "Toronto, Ontario, Canada",
+     "https://jobs.ashbyhq.com/wealthsimple"),
+    ("Jobber", "Software intern / co-op", "Edmonton, Alberta, Canada",
+     "https://jobs.ashbyhq.com/jobber"),
+    ("KOHO", "Software intern / co-op", "Toronto, Ontario, Canada",
+     "https://jobs.ashbyhq.com/koho"),
+    ("Wattpad", "Software intern / co-op", "Toronto, Ontario, Canada",
+     "https://wattpad.bamboohr.com/careers"),
+    ("Thinkific", "Software intern / co-op", "Vancouver, British Columbia, Canada",
+     "https://job-boards.greenhouse.io/thinkific"),
+    ("TextNow", "Software intern / co-op", "Waterloo, Ontario, Canada",
+     "https://www.textnow.com/careers"),
+    ("Vidyard", "Software intern / co-op", "Kitchener, Ontario, Canada",
+     "https://www.vidyard.com/careers"),
+    ("Mappedin", "Software intern / co-op", "Kitchener, Ontario, Canada",
+     "https://www.mappedin.com/careers"),
+    ("Auvik", "Software intern / co-op", "Waterloo, Ontario, Canada",
+     "https://www.auvik.com/careers"),
+    ("Tailscale", "Software intern / co-op", "Toronto, Ontario, Canada",
+     "https://tailscale.com/careers"),
+    ("OpenPhone", "Software intern / co-op", "Ottawa, Ontario, Canada",
+     "https://www.openphone.com/careers"),
+    ("Ritual", "Software intern / co-op", "Toronto, Ontario, Canada",
+     "https://ritual.co/careers"),
+    ("Wave", "Software intern / co-op", "Toronto, Ontario, Canada",
+     "https://www.waveapps.com/careers"),
+    ("League", "Software intern / co-op", "Toronto, Ontario, Canada",
+     "https://job-boards.greenhouse.io/leagueinc"),
+    ("Ampliwork", "Software intern / co-op", "Montreal, Quebec, Canada",
+     "https://ats.rippling.com/ampliwork-inc/jobs"),
+    ("Drop", "Software intern / co-op", "Toronto, Ontario, Canada",
+     "https://www.joindrop.com/careers"),
+]
+# US SWE intern employers crowd lists / Greenhouse-Ashby pollers miss — they hire on their
+# own board or by email. Title is the live or last-seen intern role, not an invented req.
+KNOWN_US_INTERN_EMPLOYERS = [
+    {
+        "company": "SproutsAI",
+        "title": "AI Software Engineering Summer Intern",
+        "location": "Palo Alto, CA, United States",
+        "url": "https://peerlist.io/company/sproutsai/careers/ai-software-engineering-summer-intern/jobha9embeqoegrbjfrao9e7eqdm6r",
+        "careers_page": "https://www.sproutsai.com/",
+        "linkedin": "https://www.linkedin.com/company/sproutsai-com/",
+        "term": "Summer",
+        "li_slug": "sproutsai-com",
+    },
+]
+
+
+def seed_known_ca_intern_employers(db: sqlite3.Connection | None = None) -> int:
+    """Ensure known Canadian intern employers are in intern history so they show on outreach
+    even when Simplify/negarprh never listed them."""
+    own = db is None
+    if own:
+        db = connect()
+    _intern_history_table(db)
+    added = 0
+    with db:
+        for company, title, location, url in KNOWN_CA_INTERN_EMPLOYERS:
+            key = norm_text(company)
+            if not key:
+                continue
+            row = db.execute(
+                "SELECT term FROM ca_intern_history WHERE company_key=?", (key,)).fetchone()
+            if row:
+                if not (row[0] or "").strip():
+                    db.execute("UPDATE ca_intern_history SET term=? WHERE company_key=?",
+                               ("unspecified", key))
+                    added += 1
+                continue
+            db.execute("INSERT INTO ca_intern_history VALUES (?,?,?,?,?,?,?,?)",
+                       (key, company, title, location, url, "unspecified", None, "known_ca_intern"))
+            added += 1
+    if own:
+        db.close()
+    return added
+
+
+def seed_known_us_intern_employers(db: sqlite3.Connection | None = None) -> int:
+    """Ensure known US intern employers show on US outreach when Simplify never listed them."""
+    own = db is None
+    if own:
+        db = connect()
+    _swe_intern_history_table(db)
+    _discover_tables(db)
+    now = datetime.now(UTC).isoformat(timespec="seconds")
+    added = 0
+    with db:
+        for entry in KNOWN_US_INTERN_EMPLOYERS:
+            company = outreach_company_name(entry["company"])
+            key = dedup_key(company)
+            if not key:
+                continue
+            row = db.execute(
+                "SELECT title FROM swe_intern_history WHERE company_key=? AND region='US'",
+                (key,)).fetchone()
+            if not row:
+                db.execute("INSERT INTO swe_intern_history VALUES (?,?,?,?,?,?,?,?,?)",
+                           (key, "US", company, entry["title"], entry["location"],
+                            entry["url"], entry.get("term") or "unspecified", None,
+                            "known_us_intern"))
+                added += 1
+            slug = (entry.get("li_slug") or "").strip().strip("/")
+            careers = (entry.get("careers_page") or "").strip()
+            name_key = norm_text(company)
+            if name_key:
+                got = db.execute(
+                    "SELECT li_slug, url FROM discovered WHERE name_key=?", (name_key,)).fetchone()
+                if not got:
+                    db.execute("INSERT INTO discovered VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                               (name_key, company, slug or None, "known_us_intern",
+                                now, now, "placed", None, None, careers or None, now))
+                else:
+                    li_slug, url = got
+                    if slug and not (li_slug or "").strip():
+                        db.execute("UPDATE discovered SET li_slug=? WHERE name_key=?",
+                                   (slug, name_key))
+                    if careers and not (url or "").strip():
+                        db.execute("UPDATE discovered SET url=? WHERE name_key=?",
+                                   (careers, name_key))
+    if own:
+        db.close()
+    return added
 
 
 def _intern_history_table(db: sqlite3.Connection) -> None:
     db.execute("""CREATE TABLE IF NOT EXISTS ca_intern_history (company_key TEXT PRIMARY KEY, company TEXT,
         title TEXT, location TEXT, url TEXT, term TEXT, posted_at TEXT, source TEXT)""")
+
+
+SWE_INTERN_HISTORY_REFRESH = 6 * 60 * 60  # live crowd lists; snapshots are hourly from outreach
+
+
+def intern_list_regions(location: str | None, title: str = "", url: str = "",
+                        company: str = "") -> set[str]:
+    """US and/or Canada for a crowd intern-list row. Silent/remote defaults to US."""
+    if isinstance(location, (list, tuple)):
+        parts = [str(p).strip() for p in location if p]
+        loc = " | ".join(parts)
+    else:
+        loc = location or ""
+        parts = [p.strip() for p in re.split(r"\s*[|;/]\s*", loc) if p.strip()] or [loc]
+    regions: set[str] = set()
+    for part in parts:
+        if canada_for_outreach(part, title, url, company):
+            regions.add("Canada")
+        if "US" in us_canada(part):
+            regions.add("US")
+    if canada_for_outreach(loc, title, url, company):
+        regions.add("Canada")
+    if regions:
+        return regions
+    unclear = (not loc) or loc.strip().lower() in {"location not listed", "remote"} or "country unclear" in loc.lower()
+    if not unclear:
+        return set()
+    if any(_FOREIGN_PLACE.search(s) or _poll.FOREIGN_COUNTRY_TAIL_RE.search(s)
+           for s in (loc, title) if s):
+        return set()
+    return {"US"}
+
+
+# Bay Area / California intern locations. `, CA` is California unless the blob is Canada
+# (Québec, CA, H4S… uses CA as the country code).
+_CALIFORNIA_PLACE_RE = re.compile(
+    r"\b(california|san francisco|sf bay|bay area|palo alto|mountain view|sunnyvale|"
+    r"cupertino|menlo park|redwood (?:city|shores)|san jose|san mateo|oakland|"
+    r"berkeley|santa clara|foster city|south san francisco|silicon valley|"
+    r"milpitas|fremont|los angeles|irvine|pasadena|santa monica|san diego|"
+    r"sacramento|newport beach|costa mesa|santa barbara|burbank|glendale|"
+    r"long beach|anaheim|pleasanton|walnut creek|san ramon|los gatos|"
+    r"el segundo|torrance|carlsbad|san carlos|burlingame|daly city|"
+    r"alameda|emeryville|culver city|venice|pasadena|sunnyvale|sf)\b",
+    re.I,
+)
+_CALIFORNIA_STATE_RE = re.compile(r",\s*CA\b|\bCA,|\bCalif\.?\b", re.I)
+_NOT_CALIFORNIA_RE = re.compile(
+    r"\b(qu[eé]bec|ontario|alberta|manitoba|saskatchewan|nova scotia|"
+    r"british columbia|new brunswick|newfoundland|prince edward island|"
+    r"canada|canadian|montreal|toronto|ottawa|vancouver,?\s*bc)\b"
+    r"|[A-CEGHJ-NPR-TVXY]\d[A-Z]\s*\d[A-Z]\d",
+    re.I,
+)
+
+
+def is_california_place(location: str | None, title: str = "") -> bool:
+    """True when an intern posting is in California / the Bay Area."""
+    blob = f"{location or ''} {title or ''}"
+    if not blob.strip():
+        return False
+    if _CALIFORNIA_PLACE_RE.search(blob):
+        return True
+    return bool(_CALIFORNIA_STATE_RE.search(blob) and not _NOT_CALIFORNIA_RE.search(blob))
+
+
+def intern_priority(intern_count: int, california_count: int = 0) -> int:
+    """Intern-heavy first; California intern locations get a real boost on the US list."""
+    return int(intern_count or 0) + 5 * int(california_count or 0)
+
+
+_intern_stats_memo: dict[str, dict[str, int]] | None = None
+
+
+def intern_hiring_stats() -> dict[str, dict[str, int]]:
+    """SWE intern listing volume per company: n / us / can / ca (California).
+
+    Unique posting URLs, software-intern titles only (not generic student jobs).
+    """
+    global _intern_stats_memo
+    if _intern_stats_memo is not None:
+        return _intern_stats_memo
+    stats: dict[str, dict[str, int]] = {}
+    seen: dict[str, set[str]] = {}
+
+    def bump(company: str, title: str, loc: str, url: str, *,
+             us: bool = False, can: bool = False) -> None:
+        if not is_software_internship(title or "", software_employer=False):
+            return
+        company = outreach_company_name(company or "")
+        key = dedup_key(company)
+        if not key or _AGENCY_RE.search(company):
+            return
+        sig = (url or "").split("?")[0].rstrip("/").lower() or f"{(title or '').lower()}|{(loc or '').lower()}"
+        got = seen.setdefault(key, set())
+        if sig in got:
+            return
+        got.add(sig)
+        slot = stats.setdefault(key, {"n": 0, "us": 0, "can": 0, "ca": 0})
+        slot["n"] += 1
+        if us:
+            slot["us"] += 1
+        if can:
+            slot["can"] += 1
+        if is_california_place(loc, title):
+            slot["ca"] += 1
+
+    db = connect()
+    try:
+        _swe_intern_history_table(db)
+        for company, title, loc, url in db.execute(
+                """SELECT company, title, location, url FROM postings
+                   WHERE instr(lower(title), 'intern') OR instr(lower(title), 'co-op')
+                      OR instr(lower(title), 'coop') OR instr(lower(title), 'stagiaire')
+                      OR instr(lower(title), 'apprentice') OR instr(lower(title), 'student')
+                      OR instr(lower(title), 'stage')"""):
+            loc = loc or ""
+            title = title or ""
+            countries = us_canada(loc)
+            bump(company or "", title, loc, url or "",
+                 us="US" in countries or (not countries and not canada_for_outreach(
+                     loc, title, url or "", company or "")),
+                 can=canada_for_outreach(loc, title, url or "", company or ""))
+        for company, title, loc, url, region in db.execute(
+                "SELECT company, title, location, url, region FROM swe_intern_history"):
+            bump(company or "", title or "", loc or "", url or "",
+                 us=region == "US", can=region == "Canada")
+    finally:
+        db.close()
+    _intern_stats_memo = stats
+    return stats
+
+
+def intern_volume_for(company: str, stats: dict[str, dict[str, int]] | None = None,
+                      region: str = "US") -> tuple[int, int]:
+    """(intern_count, california_count) for an outreach company. At least 1 if listed."""
+    stats = intern_hiring_stats() if stats is None else stats
+    key = dedup_key(outreach_company_name(company or ""))
+    s = stats.get(key) or {}
+    if region == "Canada":
+        n = int(s.get("can") or 0) or int(s.get("n") or 0)
+    else:
+        n = int(s.get("us") or 0) or int(s.get("n") or 0)
+    return max(n, 1), int(s.get("ca") or 0)
+
+
+def _swe_intern_history_table(db: sqlite3.Connection) -> None:
+    db.execute("""CREATE TABLE IF NOT EXISTS swe_intern_history (
+        company_key TEXT NOT NULL, region TEXT NOT NULL, company TEXT, title TEXT,
+        location TEXT, url TEXT, term TEXT, posted_at TEXT, source TEXT,
+        PRIMARY KEY (company_key, region))""")
+    _discover_tables(db)
+
+
+def _put_swe_history(found: dict, company: str, title: str, location: str, url: str,
+                     term: str, posted: str | None, source: str) -> None:
+    company = outreach_company_name(company or "")
+    key = dedup_key(company)
+    if not key or _AGENCY_RE.search(company or ""):
+        return
+    if not is_software_internship(title or "", software_employer=True):
+        return
+    loc = location if isinstance(location, str) else " | ".join(str(p) for p in (location or []) if p)
+    for region in intern_list_regions(loc, title or "", url or "", company):
+        slot = (key, region)
+        prev = found.get(slot)
+        if not prev or (posted or "") > (prev[5] or ""):
+            found[slot] = (key, region, company, title or "", loc, url or "",
+                           term or "", posted or "", source)
+
+
+def refresh_swe_intern_history(*, force: bool = False, snapshots: bool = False) -> int:
+    """Every SWE intern employer on crowd lists (closed/inactive included), US + Canada."""
+    db = connect()
+    _swe_intern_history_table(db)
+    last = db.execute("SELECT v FROM discover_state WHERE k='swe_intern_history_at'").fetchone()
+    if not force and last and time.time() - float(last[0]) < SWE_INTERN_HISTORY_REFRESH:
+        n = db.execute("SELECT count(*) FROM swe_intern_history").fetchone()[0]
+        db.close()
+        return n
+    found: dict[tuple[str, str], tuple] = {}
+
+    def load_json(url: str) -> list | dict | None:
+        try:
+            r = httpx.get(url, timeout=120, follow_redirects=True)
+            r.raise_for_status()
+            return r.json()
+        except Exception as exc:  # noqa: BLE001
+            log_line(f"{'intern_hist':16} {url.split('/')[3] if '/' in url else url}: {exc}")
+            return None
+
+    def ingest_simplify(items: list, source: str) -> None:
+        for x in items:
+            if not isinstance(x, dict):
+                continue
+            ts = x.get("date_posted")
+            posted = iso(datetime.fromtimestamp(ts, UTC)) if isinstance(ts, (int, float)) else None
+            term = ", ".join(str(t) for t in (x.get("terms") or []) if t) or (x.get("season") or "")
+            loc = " | ".join(x.get("locations") or [])
+            _put_swe_history(found, x.get("company_name") or x.get("company") or "",
+                             x.get("title") or "", loc, x.get("url") or "", term, posted, source)
+
+    for source, url in {**INTERN_HISTORY_LISTS, "simplify2027": LIST_SOURCES["simplify"],
+                        "vanshb03_2027": LIST_SOURCES["vanshb03"]}.items():
+        data = load_json(url)
+        if isinstance(data, list):
+            ingest_simplify(data, source)
+
+    apply = load_json(LIST_SOURCES["applyguy"])
+    if apply:
+        items = apply if isinstance(apply, list) else next(
+            (v for v in apply.values() if isinstance(v, list)), [])
+        for x in items:
+            posted = iso(x.get("posted"))
+            _put_swe_history(found, x.get("company") or "", x.get("title") or "",
+                             x.get("location") or "", x.get("listingUrl") or x.get("url") or "",
+                             "", posted, "applyguy")
+
+    try:
+        r = httpx.get(LIST_SOURCES["zshah101"], timeout=120, follow_redirects=True)
+        r.raise_for_status()
+        for row in csv.DictReader(r.text.splitlines()):
+            _put_swe_history(found, row.get("company") or "", row.get("title") or "",
+                             row.get("location") or "", row.get("url") or "",
+                             row.get("season") or row.get("seasons") or "",
+                             iso(row.get("posted_at") or row.get("first_seen_at")), "zshah101")
+    except Exception as exc:  # noqa: BLE001
+        log_line(f"{'intern_hist':16} zshah101: {exc}")
+
+    for source, url in CANADA_INTERN_HISTORY_LISTS.items():
+        try:
+            r = httpx.get(url, timeout=120, follow_redirects=True)
+            r.raise_for_status()
+        except Exception as exc:  # noqa: BLE001
+            log_line(f"{'intern_hist':16} {source}: {exc}")
+            continue
+        if source.startswith("negarprh"):
+            rows = _parse_negarprh_markdown(r.text)
+        else:
+            data = r.json()
+            raw = data if isinstance(data, list) else next(
+                (v for v in data.values() if isinstance(v, list)), [])
+            rows = [{"company": (x.get("company") or "").strip(),
+                     "title": (x.get("title") or "").strip(),
+                     "location": x.get("location") or "",
+                     "url": x.get("url") or "",
+                     "posted_at": x.get("posted_date") or x.get("first_seen") or ""} for x in raw]
+        for x in rows:
+            _put_swe_history(found, x.get("company") or "", x.get("title") or "",
+                             x.get("location") or "", x.get("url") or "",
+                             "", iso(x.get("posted_at")), source)
+
+    if snapshots:
+        try:
+            spec = importlib.util.spec_from_file_location(
+                "find_recent_intern_companies", REPO / "scripts" / "find_recent_intern_companies.py")
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+
+            async def _snapshots() -> list:
+                async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
+                    return await mod.fetch_items(client)
+
+            ingest_simplify(asyncio.run(_snapshots()), "simplify_snapshot")
+        except Exception as exc:  # noqa: BLE001
+            log_line(f"{'intern_hist':16} snapshots: {exc}")
+
+    with db:
+        for row in found.values():
+            db.execute("INSERT OR REPLACE INTO swe_intern_history VALUES (?,?,?,?,?,?,?,?,?)", row)
+        db.execute("INSERT OR REPLACE INTO discover_state VALUES ('swe_intern_history_at', ?)",
+                   (str(time.time()),))
+    n = len(found)
+    db.close()
+    log_line(f"{'intern_hist':16} {n} SWE intern employers from crowd lists (closed included)")
+    return n
 
 
 async def refresh_intern_history(db: sqlite3.Connection, client: httpx.AsyncClient) -> int:
@@ -685,13 +1354,53 @@ async def refresh_intern_history(db: sqlite3.Connection, client: httpx.AsyncClie
             company, title = (x.get("company_name") or "").strip(), (x.get("title") or "").strip()
             locations = [loc for loc in x.get("locations") or [] if "Canada" in us_canada(loc)]
             key = norm_text(company)
-            if not key or not locations or not is_software_internship(title):
+            if not key or not locations or not is_software_internship(
+                    title, software_employer=_is_ca_software_company(company)):
                 continue
             ts = x.get("date_posted")
             posted = iso(datetime.fromtimestamp(ts, UTC)) if isinstance(ts, (int, float)) else None
             term = ", ".join(x.get("terms") or []) or (x.get("season") or "")
             if key not in found or (posted or "") > (found[key][5] or ""):
                 found[key] = (company, title, locations[0], x.get("url") or "", term, posted, source)
+    for source, url in CANADA_INTERN_HISTORY_LISTS.items():
+        try:
+            r = await client.get(url, timeout=120)
+            r.raise_for_status()
+        except Exception as exc:  # noqa: BLE001
+            log_line(f"{'discover':16} intern history {source}: {exc}")
+            continue
+        if source.startswith("negarprh"):
+            rows = _parse_negarprh_markdown(r.text)
+        else:
+            data = r.json()
+            items = data if isinstance(data, list) else next(
+                (v for v in data.values() if isinstance(v, list)), [])
+            rows = []
+            for x in items:
+                posted_raw = x.get("posted_date") or x.get("first_seen") or ""
+                if isinstance(posted_raw, (int, float)):
+                    posted = iso(datetime.fromtimestamp(posted_raw, UTC))
+                else:
+                    s = str(posted_raw).strip()
+                    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+                        s = s + "T00:00:00+00:00"
+                    posted = iso(s)
+                rows.append({"company": (x.get("company") or "").strip(),
+                             "title": (x.get("title") or "").strip(),
+                             "location": x.get("location") or "",
+                             "url": x.get("url") or "",
+                             "posted_at": posted or ""})
+        for x in rows:
+            company, title = x.get("company") or "", x.get("title") or ""
+            loc, link = x.get("location") or "", x.get("url") or ""
+            key = norm_text(company)
+            if (not key or not is_software_internship(title, software_employer=True)
+                    or not canada_for_outreach(loc, title, link, company)):
+                continue
+            posted = x.get("posted_at")
+            term = ", ".join(terms_for_posting(title, link, posted, False))
+            if key not in found or (posted or "") > (found[key][5] or ""):
+                found[key] = (company, title, loc, link, term, posted, source)
     if not found:
         return 0
     with db:
@@ -710,18 +1419,526 @@ SUMMER_2027_POSTED_FROM = "2026-05-01"  # earlier postings belong to an earlier 
 
 
 def _summer_2027(title: str, url: str | None = "", posted_at: str | None = None) -> bool:
-    """Title or link says summer or 2027, names no other year, and isn't only another term
-    ("Winter 2027"). Untermed titles don't count: Canadian co-ops posted in the fall are
-    usually for winter, and lists keep old postings open."""
+    """True when this posting is Summer 2027 hiring we should not cold-message about.
+
+    Dual-term titles ("Winter or Summer 2027", "Winter 2027 & Summer 2027") stay False:
+    that company is still in the winter cycle, so it belongs on outreach. Untermed
+    titles don't count: Canadian co-ops posted in the fall are usually for winter.
+    """
     from urllib.parse import unquote
 
     if posted_at and posted_at < SUMMER_2027_POSTED_FROM:
         return False
+    terms = terms_for_posting(title, url, posted_at, is_open=False)
+    if "Winter 2027" in terms:
+        return False
+    if "Summer 2027" in terms:
+        return True
+    if any(t.startswith("Summer ") for t in terms):
+        return False  # Summer 2025/2026 is history, not a 2027 exclude
     text = f"{title} {unquote(url or '')}".replace("-", " ").replace("_", " ")
     if _OTHER_YEAR.search(text) and "2027" not in text:
         return False
+    if _WINTER_MONTH.search(text):
+        return False
+    # "Summer or Winter" / "Winter & Summer" without a year: still a winter employer.
+    if _SUMMER.search(text) and _OTHER_TERM.search(text):
+        return False
     summer = bool(_SUMMER.search(text))
     return summer or ("2027" in text and not _OTHER_TERM.search(text))
+
+
+# Co-op terms we keep for the intern-employer directory (Winter 2027 first).
+# Summer 2027 stays — those companies hired SWE interns too.
+TARGET_COOP_TERMS = [
+    "Winter 2027", "Spring 2027", "Summer 2027", "Fall 2026", "Summer 2026",
+    "Winter 2026", "Fall 2025", "Summer 2025",
+    "unspecified",  # intern employers with no named cycle (Payfacto, …)
+]
+COOP_TERM_RANK = {t: i for i, t in enumerate(TARGET_COOP_TERMS)}
+WINTER_CSV = OUT_DIR / "winter_2027_companies.csv"
+US_SPONSOR_CSV = OUT_DIR / "us_sponsor_companies.csv"
+RECENT_CSV = OUT_DIR / "recent_intern_companies.csv"
+ALREADY_2027_CSV = OUT_DIR / "already_summer2027.csv"
+# Rolling/generic titles where Summer 2027 is real but never appears in the title text.
+SUMMER_2027_MANUAL = {"microsoft"}  # norm_text("Microsoft")
+
+_SEASON_NAME = {
+    "winter": "Winter", "hiver": "Winter",
+    "spring": "Spring", "printemps": "Spring",
+    "summer": "Summer", "ete": "Summer", "été": "Summer",
+    "fall": "Fall", "autumn": "Fall", "automne": "Fall",
+}
+# "Winter 2027", "Winter Co-op 2027", "Winter/January 2027", "2027 Winter Intern"
+_SEASON = r"winter|spring|summer|fall|autumn|hiver|automne|printemps|[eé]t[eé]"
+_ROLE_GAP = r"(?:[\s,/-]+(?:co[\s-]?op|intern(?:ship)?|stage|stagiaire))?"
+_MONTH = r"(?:jan(?:uary)?|fév(?:rier)?|feb(?:ruary)?|mar(?:ch)?|avr(?:il)?|apr(?:il)?|may|mai|juin|june|juil(?:let)?|jul(?:y)?|aug(?:ust)?|août|sep(?:t(?:embre|ember)?)?|oct(?:obre|ober)?|nov(?:embre|ember)?|déc(?:embre)?|dec(?:ember)?)"
+_TERM_IN_TEXT = re.compile(
+    rf"\b({_SEASON})(?:\s*/\s*{_MONTH})?{_ROLE_GAP}\s*,?\s*(20\d{{2}})\b|"
+    rf"\b(20\d{{2}}){_ROLE_GAP}\s*,?\s*({_SEASON})\b",
+    re.I,
+)
+# "Winter or Summer 2027", "Winter & Summer2027", "2027 Summer/Winter"
+_DUAL_TERM = re.compile(
+    rf"\b({_SEASON})\s*(?:or|/|&|,|and|et)\s*({_SEASON})\s*(20\d{{2}})\b|"
+    rf"\b(20\d{{2}})\s*({_SEASON})\s*(?:or|/|&|,|and|et)\s*({_SEASON})\b",
+    re.I,
+)
+# "janvier 2027" / "January 2027" is Winter, not an untermed 2027 (= Summer) posting.
+_WINTER_MONTH = re.compile(
+    r"\b(jan(?:uary)?|janvier|f[eé]v(?:rier)?|feb(?:ruary)?)\.?\s*,?\s*(20\d{2})\b",
+    re.I,
+)
+_BARE_SEASON = re.compile(rf"\b({_SEASON})\b", re.I)
+INTERN_HISTORY_FROM = "2025-05-01"  # Summer 2025 is the oldest cycle we keep for outreach
+
+
+def _season_of(raw: str) -> str:
+    raw_n = raw.lower().replace("é", "e")
+    return _SEASON_NAME.get(raw_n) or _SEASON_NAME.get(raw.lower()) or raw.title()
+
+
+def posting_terms(title: str, url: str | None = "") -> list[str]:
+    """Canonical co-op terms named in a job title or URL ('Winter 2027', 'Hiver 2027', …)."""
+    from urllib.parse import unquote
+
+    text = f"{title} {unquote(url or '')}".replace("-", " ").replace("_", " ")
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def add(season: str, year: str) -> None:
+        term = f"{season} {year}"
+        if term not in seen:
+            seen.add(term)
+            out.append(term)
+
+    for m in _TERM_IN_TEXT.finditer(text):
+        if m.group(1):
+            add(_season_of(m.group(1)), m.group(2))
+        else:
+            add(_season_of(m.group(4)), m.group(3))
+    for m in _DUAL_TERM.finditer(text):
+        if m.group(1):
+            year = m.group(3)
+            add(_season_of(m.group(1)), year)
+            add(_season_of(m.group(2)), year)
+        else:
+            year = m.group(4)
+            add(_season_of(m.group(5)), year)
+            add(_season_of(m.group(6)), year)
+    for m in _WINTER_MONTH.finditer(text):
+        add("Winter", m.group(2))
+    return out
+
+
+def coop_term_from_posted(posted_at: str | None) -> str | None:
+    """Best-effort Canadian co-op cycle from when the intern role was posted.
+
+    Fall postings (Aug–Dec) are Winter of the next year; May–July is that year's
+    Summer; Jan–Apr is Winter of the same year. Older than Summer 2025 is ignored.
+    """
+    if not posted_at or posted_at[:10] < INTERN_HISTORY_FROM:
+        return None
+    try:
+        y, m = int(posted_at[:4]), int(posted_at[5:7])
+    except ValueError:
+        return None
+    if m >= 8:
+        return f"Winter {y + 1}"
+    if m >= 5:
+        return f"Summer {y}"
+    return f"Winter {y}"
+
+
+def terms_for_posting(title: str, url: str | None = "", posted_at: str | None = None,
+                      is_open: bool = False) -> list[str]:
+    """Named terms, then a bare 'Winter'/'Hiver' (no year), then the posting date."""
+    named = [t for t in posting_terms(title, url) if t != "N/A"]
+    if named:
+        return named
+    from urllib.parse import unquote
+
+    text = f"{title} {unquote(url or '')}".replace("-", " ").replace("_", " ")
+    out: list[str] = []
+    seen: set[str] = set()
+    y = mth = None
+    if posted_at and len(posted_at) >= 7:
+        try:
+            y, mth = int(posted_at[:4]), int(posted_at[5:7])
+        except ValueError:
+            y = mth = None
+    for match in _BARE_SEASON.finditer(text):
+        season = _season_of(match.group(1))
+        year: int | None = None
+        if y is not None and mth is not None:
+            if season == "Winter":
+                year = y + 1 if mth >= 8 else y
+            elif season == "Fall":
+                year = y
+            elif season == "Summer":
+                year = y + 1 if mth >= 8 else y  # Aug–Dec postings are next summer
+            elif season == "Spring":
+                year = y + 1 if mth >= 8 else y
+        if year is None:
+            year = {"Winter": 2027, "Spring": 2027, "Fall": 2026, "Summer": 2027}.get(season)
+        term = f"{season} {year}"
+        if term not in seen:
+            seen.add(term)
+            out.append(term)
+    if out:
+        return out
+    if is_open:
+        return ["Winter 2027"]
+    inferred = coop_term_from_posted(posted_at)
+    return [inferred] if inferred else []
+
+
+def _term_parts(raw: str | list | None) -> list[str]:
+    if raw is None:
+        return []
+    items = raw if isinstance(raw, (list, tuple)) else str(raw).split(",")
+    out: list[str] = []
+    for t in items:
+        t = str(t).strip()
+        if t and t not in ("N/A", "None"):
+            out.append(t)
+    return out
+
+
+def canonical_coop_terms(raw: str | list | None, title: str, url: str | None,
+                         posted_at: str | None, is_open: bool) -> tuple[list[str], bool]:
+    """Map GitHub/history term fields onto TARGET_COOP_TERMS.
+
+    Crowd lists often store ``Winter`` or ``N/A`` instead of ``Winter 2027``. Treating
+    those as the only terms made ``keep`` empty, so the company never reached outreach
+    even though we had a posting date. An explicit ``Summer 2027`` tag still excludes
+    (unless Winter 2027 is also named) and is not overridden by the date heuristic.
+    """
+    parts = _term_parts(raw)
+    tagged_su27 = any(re.sub(r"\s+", " ", p).casefold() == "summer 2027" for p in parts)
+    keep: list[str] = []
+    seen: set[str] = set()
+
+    def add(term: str) -> None:
+        if term in COOP_TERM_RANK and term not in seen:
+            seen.add(term)
+            keep.append(term)
+
+    for p in parts:
+        add(p)
+    inferred = terms_for_posting(title, url, posted_at, is_open)
+    if tagged_su27 and "Winter 2027" not in keep:
+        for t in inferred:
+            if t != "Winter 2027":
+                add(t)
+        return keep, True
+    for t in inferred:
+        add(t)
+    su27 = tagged_su27 or _summer_2027(title, url, posted_at)
+    return keep, bool(su27 and "Winter 2027" not in keep)
+
+
+_TOKEN_STOP = {"inc", "ltd", "llc", "ulc", "the", "of", "and", "et", "company", "co",
+               "corp", "corporation", "group", "holdings", "limited", "plc"}
+
+
+def company_tokens(name: str) -> tuple[str, ...]:
+    words = re.findall(r"[a-z0-9]+", (outreach_company_name(name) or "").lower())
+    return tuple(w for w in words if w not in _TOKEN_STOP)
+
+
+def already_excludes(key: str, company: str, already: dict[str, str]) -> bool:
+    """True if this employer already posted Summer 2027 (same name or a division of it).
+
+    Token prefix, not substring: 'Amazon Development Centre' matches 'Amazon',
+    but 'Marsh' does not match 'Mars' and 'Super' does not match 'Superhuman'.
+    """
+    if key in already:
+        return True
+    ct = company_tokens(company)
+    if not ct:
+        return False
+    for ename in already.values():
+        et = company_tokens(ename)
+        if not et:
+            continue
+        if ct == et:
+            return True
+        if len(et) <= len(ct) and ct[:len(et)] == et:
+            return True
+        if len(ct) <= len(et) and et[:len(ct)] == ct:
+            return True
+    return False
+
+
+def _ca_software_employers() -> dict[str, str]:
+    """dedup key → name for canada_software_companies.csv (~5k Canadian SWE employers)."""
+    out: dict[str, str] = {}
+    if not CA_COMPANIES_CSV.exists():
+        return out
+    with CA_COMPANIES_CSV.open(newline="", encoding="utf-8") as fh:
+        for row in csv.DictReader(fh):
+            name = outreach_company_name(row.get("company") or "")
+            k = dedup_key(name)
+            if k and k not in out:
+                out[k] = name
+    return out
+
+
+def _load_already_2027() -> dict[str, str]:
+    out: dict[str, str] = {}
+    if ALREADY_2027_CSV.exists():
+        with ALREADY_2027_CSV.open(newline="", encoding="utf-8") as fh:
+            for row in csv.DictReader(fh):
+                key = (row.get("company_key") or "").strip()
+                if key:
+                    out[key] = row.get("company") or key
+    for name in SUMMER_2027_MANUAL:
+        out.setdefault(name, name)
+    return out
+
+
+def collect_coop_companies(github_items: list[dict] | None = None) -> tuple[list[dict], dict[str, str], int]:
+    """Canadian software intern/co-op employers we've actually seen (open or closed).
+
+    Includes Summer 2027. Ranked Winter 2027 first. Crowd intern lists + our postings.
+    """
+    by_company: dict[str, dict[str, tuple[str, str, str, str]]] = {}
+    already_2027 = _load_already_2027()
+    seen_su27_this_run: set[str] = set()
+    open_now: set[str] = set()
+    ca5k = _ca_software_employers()
+
+    def note(company: str, title: str, location: str, url: str, terms: list[str],
+             is_summer_2027: bool = False) -> None:
+        company = outreach_company_name(company)
+        key = dedup_key(company)
+        if not key:
+            return
+        # Dual-term "Winter or Summer 2027" is still a winter employer. Summer-only
+        # companies stay on the directory — they hired SWE interns too.
+        if (is_summer_2027 or "Summer 2027" in terms) and "Winter 2027" not in terms:
+            already_2027.setdefault(key, company)
+            seen_su27_this_run.add(key)
+        keep = [t for t in terms if t in COOP_TERM_RANK]
+        if not keep:
+            keep = ["unspecified"]
+        slot = by_company.setdefault(key, {})
+        for term in keep:
+            slot.setdefault(term, (company, title, location, url))
+
+    def note_live(company: str, title: str, location: str, url: str,
+                  posted_at: str | None = None, is_open: bool = True) -> None:
+        if not company or not is_software_internship(
+                title, software_employer=_is_ca_software_company(company)):
+            return
+        if not location:
+            location = ""
+        if not canada_for_outreach(location, title, url or "", company):
+            return
+        company = outreach_company_name(company)
+        key = dedup_key(company)
+        terms = terms_for_posting(title, url, posted_at, is_open)
+        su27 = _summer_2027(title, url, posted_at)
+        if su27 and "Winter 2027" not in terms:
+            note(company, title, location, url or "", terms, is_summer_2027=True)
+            return
+        note(company, title, location, url or "", terms)
+        if is_open and key:
+            open_now.add(key)
+
+    for x in github_items or []:
+        company, title = (x.get("company_name") or "").strip(), (x.get("title") or "").strip()
+        url = x.get("url") or ""
+        locations = [loc for loc in x.get("locations") or []
+                     if canada_for_outreach(loc, title, url, company)]
+        if not company or not locations or not is_software_internship(
+                title, software_employer=_is_ca_software_company(company)):
+            continue
+        terms_raw = [t.strip() for t in (x.get("terms") or []) if t and str(t).strip() not in ("N/A", "")]
+        ts = x.get("date_posted")
+        posted = iso(datetime.fromtimestamp(ts, UTC)) if isinstance(ts, (int, float)) else None
+        terms, su27 = canonical_coop_terms(terms_raw, title, url, posted, False)
+        note(company, title, locations[0], url, terms, is_summer_2027=su27)
+
+    db = connect()
+    _intern_history_table(db)
+    for company, title, location, url, term, posted_at in db.execute(
+            "SELECT company, title, location, url, term, posted_at FROM ca_intern_history"):
+        if (not company or not is_software_internship(
+                title or "", software_employer=_is_ca_software_company(company))
+                or not canada_for_outreach(location or "", title or "", url or "", company)):
+            continue
+        terms, su27 = canonical_coop_terms(term, title or "", url or "", posted_at, False)
+        note(company, title or "", location or "", url or "", terms, is_summer_2027=su27)
+
+    _swe_intern_history_table(db)
+    for company, title, location, url, term, posted_at in db.execute(
+            "SELECT company, title, location, url, term, posted_at FROM swe_intern_history WHERE region='Canada'"):
+        if not company:
+            continue
+        terms, su27 = canonical_coop_terms(term, title or "", url or "", posted_at, False)
+        note(company, title or "", location or "", url or "", terms, is_summer_2027=su27)
+
+    for company, title, location, url, posted_at, is_open in db.execute(
+            "SELECT company, title, location, url, posted_at, open FROM postings"):
+        if not canada_for_outreach(location, title, url or "", company):
+            continue
+        note_live(company, title, location, url or "", posted_at, bool(is_open))
+    db.close()
+
+    # The internships CSVs the pollers already write — canada_internships.csv is the Canadian
+    # file; all_open_internships.csv is every open intern, filtered to Canada here.
+    def note_csv(path: Path) -> None:
+        if not path.exists():
+            return
+        with path.open(newline="", encoding="utf-8") as fh:
+            for row in csv.DictReader(fh):
+                loc = row.get("location") or ""
+                company = row.get("company") or ""
+                if not canada_for_outreach(loc, row.get("title") or "",
+                                           row.get("link") or "", company):
+                    continue
+                note_live(company, row.get("title") or "", loc,
+                          row.get("link") or "", None, True)
+
+    note_csv(CA_CSV_PATH)
+    note_csv(ALL_CSV_PATH)
+
+    if RECENT_CSV.exists() and github_items is None:
+        # Keep GitHub-snapshot terms from the last find_recent run when this is called from
+        # write_csv (no network).
+        with RECENT_CSV.open(newline="", encoding="utf-8") as fh:
+            for row in csv.DictReader(fh):
+                company = (row.get("company") or "").strip()
+                terms_raw = [t.strip() for t in (row.get("terms_matched") or "").split(",") if t.strip()]
+                example = row.get("example_job") or ""
+                title = example.rsplit(" (", 1)[0] if example else ""
+                loc = example[len(title) + 2:-1] if example.endswith(")") and " (" in example else ""
+                if not canada_for_outreach(loc, title, row.get("example_link") or "", company):
+                    continue
+                terms, su27 = canonical_coop_terms(
+                    terms_raw, title, row.get("example_link") or "", None, False)
+                note(company, title, loc, row.get("example_link") or "", terms, is_summer_2027=su27)
+
+    careers: dict[str, tuple[str, str]] = {}
+    for path in (CA_COMPANIES_CSV, OUT_DIR / "discovered.csv"):
+        if not path.exists():
+            continue
+        with path.open(newline="", encoding="utf-8") as fh:
+            for row in csv.DictReader(fh):
+                key = dedup_key(outreach_company_name(row.get("company") or ""))
+                if key and key not in careers:
+                    careers[key] = (row.get("careers_page") or "", row.get("ats") or "")
+    slugs: dict[str, str] = {}
+    db = connect()
+    for name, slug in db.execute(
+            "SELECT name, li_slug FROM discovered WHERE li_slug IS NOT NULL AND li_slug != ''"):
+        key = dedup_key(outreach_company_name(name))
+        if key and key not in slugs:
+            slugs[key] = slug
+    db.close()
+
+    # A stale already_summer2027.csv row (Geotab) must not hide a company that currently
+    # has Winter 2027 Canadian intern evidence and no Summer 2027 posting this run.
+    for key, slot in by_company.items():
+        if "Winter 2027" in slot and key in already_2027 and key not in seen_su27_this_run:
+            if key not in SUMMER_2027_MANUAL:
+                already_2027.pop(key, None)
+
+    stats = intern_hiring_stats()
+    rows = []
+    skipped = 0
+    for key, terms in by_company.items():
+        company, best_title, best_loc, best_url = next(iter(terms.values()))
+        matched = sorted(terms, key=lambda t: COOP_TERM_RANK[t])
+        company, best_title, best_loc, best_url = terms[matched[0]]
+        company = ca5k.get(key, company)
+        page, ats = careers.get(key, ("", ""))
+        intern_n, intern_ca = intern_volume_for(company, stats, region="Canada")
+        rows.append({
+            "company": company,
+            "terms_matched": ", ".join(matched),
+            "term_count": len(matched),
+            "intern_count": intern_n,
+            "california_count": intern_ca,
+            "winter_2027": "yes" if "Winter 2027" in terms else "",
+            "open_now": "yes" if key in open_now else "",
+            "example_job": f"{best_title} ({best_loc})" if best_loc else best_title,
+            "example_link": best_url,
+            "careers_page": page,
+            "ats": ats,
+            "linkedin": f"https://www.linkedin.com/company/{slugs[key]}/" if key in slugs else "",
+        })
+    rows.sort(key=lambda r: (
+        -int(r["intern_count"]),
+        0 if r["winter_2027"] else 1,
+        0 if r["open_now"] else 1,
+        COOP_TERM_RANK.get(r["terms_matched"].split(", ")[0], 99),
+        r["company"].lower(),
+    ))
+    return rows, already_2027, skipped
+
+
+def write_winter_companies() -> int:
+    """engineering-ats/winter_2027_companies.csv: every Canadian SWE intern employer."""
+    OUT_DIR.mkdir(exist_ok=True)
+    with open(OUT_DIR / ".outreach.rebuild.lock", "w") as lock_fh:
+        fcntl.flock(lock_fh, fcntl.LOCK_EX)
+        return _write_winter_companies_locked()
+
+
+def _write_winter_companies_locked() -> int:
+    seed_known_ca_intern_employers()
+    seed_known_us_intern_employers()
+    try:
+        refresh_swe_intern_history()
+    except Exception as exc:  # noqa: BLE001 — local sqlite/postings still build the list
+        log_line(f"{'intern_hist':16} {exc}")
+    rows, already_2027, skipped = collect_coop_companies()
+    header = ["company", "winter_2027", "open_now", "terms_matched", "term_count",
+              "intern_count", "california_count",
+              "example_job", "example_link", "careers_page", "ats", "linkedin"]
+    _write_rows(WINTER_CSV, header, [[r[h] for h in header] for r in rows])
+    with ALREADY_2027_CSV.open("w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(["company_key", "company"])
+        w.writerows(sorted(already_2027.items()))
+    try:
+        _refresh_outreach_xlsx()
+    except Exception as exc:  # noqa: BLE001 — Excel rebuild must not stall the live CSVs
+        log_line(f"outreach tracker failed: {exc}")
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "us_sponsor_outreach", REPO / "scripts" / "us_sponsor_outreach.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        mod.write_us_sponsor_companies()
+    except Exception as exc:  # noqa: BLE001 — US list must not stall Canada outreach
+        log_line(f"us sponsor outreach failed: {exc}")
+    return len(rows)
+
+
+def _refresh_outreach_xlsx() -> None:
+    """Keep applications/outreach_tracker.xlsx in sync with winter_2027_companies.csv.
+    Not a second board crawl — the internship watchers already polled."""
+    import hashlib
+    h = hashlib.md5()
+    for path in (WINTER_CSV, ALREADY_2027_CSV, DISCOVERED_CSV):
+        if path.exists():
+            h.update(path.read_bytes())
+    digest = h.hexdigest()
+    stamp = OUT_DIR / ".outreach.hash"
+    xlsx = REPO / "applications" / "outreach_tracker.xlsx"
+    if stamp.exists() and xlsx.exists() and xlsx.stat().st_size >= 2048 and stamp.read_text().strip() == digest:
+        return
+    spec = importlib.util.spec_from_file_location(
+        "build_outreach_tracker", REPO / "scripts" / "build_outreach_tracker.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    n = mod.write_xlsx()
+    if n is not None and n >= 0:
+        log_line(f"{'outreach':16} {n} Canadian SWE intern employers")
 
 
 def _write_rows(path: Path, header: list[str], rows: list[list[str]]) -> None:
@@ -783,21 +2000,28 @@ async def check_greenhouse(client: httpx.AsyncClient, row: dict[str, str]) -> li
     slug = CONFIGS["greenhouse"]["slug"](row)
     r = await client.get(f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs")
     r.raise_for_status()
-    out = []
-    for j in r.json().get("jobs", []):
+    jobs = r.json().get("jobs", [])
+    for j in jobs:
         note_ca_software(j.get("title"), (j.get("location") or {}).get("name"), url=j.get("absolute_url"))
-        loc = keep(j.get("title") or "", (j.get("location") or {}).get("name"))
-        if (loc is None and is_software_internship(j.get("title") or "")
-                and _NO_PLACE.match((j.get("location") or {}).get("name") or "")):
-            # Some boards put the work mode ("In-Office", "Hybrid") where the city goes (Cloudflare);
-            # the job's offices say where it is.
-            offices = await _greenhouse_offices(client, slug, j.get("id"))
-            if offices:
-                loc = keep(j.get("title") or "", offices)
-        if loc is not None:
-            out.append({"title": j["title"].strip(), "location": loc, "url": j.get("absolute_url") or "",
-                        "posted_at": iso(j.get("first_published") or j.get("updated_at"))})
-    return out
+    token = _SOFTWARE_EMPLOYER.set(True) if _CA_HIRING.get() else None
+    try:
+        out = []
+        for j in jobs:
+            loc = keep(j.get("title") or "", (j.get("location") or {}).get("name"))
+            if (loc is None and is_software_internship(j.get("title") or "")
+                    and _NO_PLACE.match((j.get("location") or {}).get("name") or "")):
+                # Some boards put the work mode ("In-Office", "Hybrid") where the city goes (Cloudflare);
+                # the job's offices say where it is.
+                offices = await _greenhouse_offices(client, slug, j.get("id"))
+                if offices:
+                    loc = keep(j.get("title") or "", offices)
+            if loc is not None:
+                out.append({"title": j["title"].strip(), "location": loc, "url": j.get("absolute_url") or "",
+                            "posted_at": iso(j.get("first_published") or j.get("updated_at"))})
+        return out
+    finally:
+        if token is not None:
+            _SOFTWARE_EMPLOYER.reset(token)
 
 
 WORKDAY_SEARCH_WORDS = ("intern", "co-op", "stagiaire", "student")  # fallback when no intern filter
@@ -912,6 +2136,8 @@ async def check_scraper(ats: str, row: dict[str, str], timeout: float) -> list[d
     kwargs = cfg["kwargs"](row) if cfg.get("kwargs") else {}
     scraper = cfg["scraper"](slug, timeout=timeout, **kwargs)
     scraper.include_descriptions = ats in NEEDS_DETAIL
+    if ats == "eightfold":
+        scraper.queries = EIGHTFOLD_QUERIES
     jobs = await scraper.afetch()
     # Some boards (iCIMS for many tenants) list jobs without a location; it's only on the
     # detail page. Fetch details just for software-internship titles that lack one.
@@ -969,6 +2195,30 @@ def _relative_date(text: str) -> str | None:
     return dt.isoformat(timespec="seconds")
 
 
+def _parse_negarprh_markdown(text: str) -> list[dict[str, str]]:
+    """Rows from negarprh/Canadian-Tech-Internships-2027 README tables.
+
+    | Company | Role | Location | Apply | Date Posted |  ("↳" repeats the company above)
+    """
+    last = ""
+    rows: list[dict[str, str]] = []
+    for line in text.splitlines():
+        if not line.startswith("|") or set(line.replace("|", "").strip()) <= set("-: "):
+            continue
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if len(cells) < 5 or _cell_text(cells[0]).lower() == "company":
+            continue
+        company = _cell_text(cells[0]).strip("* ")
+        company = last if company in ("", "↳") else company
+        last = company
+        title, location, link = _cell_text(cells[1]), _cell_text(cells[2]), _cell_link(cells[3])
+        if not company or not title:
+            continue
+        rows.append({"company": company, "title": title, "location": location, "url": link or "",
+                     "posted_at": _relative_date(_cell_text(cells[4])) or ""})
+    return rows
+
+
 async def check_list(source: str, timeout: float) -> list[dict[str, Any]]:
     async with httpx.AsyncClient(timeout=max(timeout, 60), follow_redirects=True) as client:
         r = await client.get(LIST_SOURCES[source])
@@ -994,23 +2244,11 @@ async def check_list(source: str, timeout: float) -> list[dict[str, Any]]:
                         "posted_text": "day precision"})
         return out
     if source == "negarprh":
-        # | Company | Role | Location | Apply | Date Posted |  ("↳" = same company as above)
-        last = ""
-        for line in r.text.splitlines():
-            if not line.startswith("|") or set(line.replace("|", "").strip()) <= set("-: "):
+        for x in _parse_negarprh_markdown(r.text):
+            loc = keep(x["title"], x["location"])
+            if loc is None or not x.get("url"):
                 continue
-            cells = [c.strip() for c in line.strip().strip("|").split("|")]
-            if len(cells) < 5 or _cell_text(cells[0]).lower() == "company":
-                continue
-            company = _cell_text(cells[0]).strip("* ")
-            company = last if company in ("", "↳") else company
-            last = company
-            title, location, link = _cell_text(cells[1]), _cell_text(cells[2]), _cell_link(cells[3])
-            loc = keep(title, location)
-            if loc is None or not link:
-                continue
-            out.append({"company": company, "title": title, "location": loc, "url": link,
-                        "posted_at": _relative_date(_cell_text(cells[4])), "posted_text": "day precision"})
+            out.append({**x, "location": loc, "posted_text": "day precision"})
         return out
     if source == "interndock":
         import html as _html
@@ -1165,6 +2403,149 @@ async def check_remoterocketship(timeout: float) -> list[dict[str, Any]]:
                             "location": loc, "url": url, "posted_at": iso(x.get("created_at"))}
     if failed == len(REMOTEROCKETSHIP_SEARCHES):
         raise RuntimeError("remoterocketship: no page had job data; the site probably changed")
+    return list(out.values())
+
+
+# simplify.jobs carries far more postings than Simplify's GitHub list. The page is rendered
+# in JavaScript, so load it in a plain headless browser (sorted by most recently updated)
+# and read the job data the page loads as it scrolls.
+SIMPLIFYJOBS_URL = "https://simplify.jobs/jobs?type=Internship&functions=Software+Engineering&sort=updated"
+SIMPLIFYJOBS_MAX_PAGES = 40  # 21 jobs a page
+SIMPLIFYJOBS_HOURS = 48  # stop scrolling once the page reaches jobs updated longer ago than this
+
+
+def _headless_chromium() -> str | None:
+    """Path to a downloaded Playwright headless shell, whatever version the package expects."""
+    import glob
+    found = sorted(glob.glob(str(Path.home() / ".cache/ms-playwright/chromium_headless_shell-*/"
+                                 "chrome-headless-shell-linux64/chrome-headless-shell")))
+    return found[-1] if found else None
+
+
+async def check_simplifyjobs() -> list[dict[str, Any]]:
+    """US/Canadian software internships on simplify.jobs, newest first."""
+    from playwright.async_api import async_playwright
+
+    docs: dict[str, dict[str, Any]] = {}
+    oldest = [time.time()]
+
+    async def on_response(r: Any) -> None:
+        if "multi_search" not in r.url:
+            return
+        try:
+            data = json.loads(await r.text())
+        except Exception:  # noqa: BLE001 — a response we can't read just adds nothing
+            return
+        for res in data.get("results") or []:
+            for hit in res.get("hits") or []:
+                d = hit.get("document") or {}
+                if d.get("id"):
+                    docs[d["id"]] = d
+                    oldest[0] = min(oldest[0], d.get("updated_date") or oldest[0])
+
+    async with async_playwright() as p:
+        # The big_ats service runs near its memory limit, where Chromium can take over 30 s to start.
+        browser = await p.chromium.launch(executable_path=_headless_chromium(), timeout=120_000)
+        try:
+            page = await browser.new_page(viewport={"width": 1400, "height": 1000})
+            page.on("response", on_response)
+            await page.goto(SIMPLIFYJOBS_URL, wait_until="domcontentloaded", timeout=120_000)
+            await page.wait_for_timeout(8_000)
+            for _ in range(SIMPLIFYJOBS_MAX_PAGES):
+                if time.time() - oldest[0] > SIMPLIFYJOBS_HOURS * 3600:
+                    break
+                before = len(docs)
+                await page.mouse.move(400, 600)
+                await page.mouse.wheel(0, 20_000)
+                await page.wait_for_timeout(2_500)
+                if len(docs) == before:
+                    break
+        finally:
+            await browser.close()
+    if not docs:
+        raise RuntimeError("simplifyjobs: no jobs loaded; blocked or the site changed")
+
+    out: dict[str, dict[str, Any]] = {}
+    now = time.time()
+    for d in docs.values():
+        countries = d.get("physical_countries") or []
+        iso_code = {"United States": "US", "Canada": "CA"}.get(countries[0]) if len(countries) == 1 else None
+        loc = keep(d.get("title") or "", " | ".join(d.get("locations") or []) or None, iso_code)
+        if loc is None:
+            continue
+        url = f"https://simplify.jobs/p/{d['id']}"
+        posted = d.get("start_date") or d.get("updated_date")
+        out[url] = {"company": (d.get("company_name") or "").strip(), "title": (d.get("title") or "").strip(),
+                    "location": loc, "url": url,
+                    "posted_at": iso(datetime.fromtimestamp(min(posted, now), UTC)) if posted else None}
+    return list(out.values())
+
+
+# Without a country, Built In lists jobs near the visitor's IP, so ask for each country.
+BUILTIN_SEARCHES = tuple(f"https://builtin.com/jobs/{cat}/internship?country={country}"
+                         for country in ("USA", "CAN") for cat in ("dev-engineering", "data-analytics"))
+BUILTIN_MAX_PAGES = 15
+_BUILTIN_AGE = re.compile(r"fa-clock[^>]*></i>\s*(?:(?:Re)?[Pp]osted\s+)?([^<]{2,30}?)\s*<")
+
+
+def _builtin_age(text: str) -> str | None:
+    """'22 Days Ago' / 'One Month Ago' / 'Yesterday' / '5 Hours Ago' → ISO timestamp."""
+    text = re.sub(r"\b(one|an|a)\b", "1", text.lower())
+    if "yesterday" in text:
+        return _relative_date("1d")
+    m = re.match(r"(\d+)\+?\s*(minute|hour|day|week|month)", text)
+    if not m:
+        return None
+    n, unit = int(m[1]), m[2]
+    return _relative_date(f"{n * 30}d" if unit == "month" else f"{n}{unit[0]}")
+
+
+async def check_builtin(timeout: float) -> list[dict[str, Any]]:
+    """Built In's software and data internship listings (companies post there directly)."""
+    import html as _html
+
+    import httpcloak
+
+    out: dict[str, dict[str, Any]] = {}
+    seen: set[str] = set()
+    pages_read = 0
+    for search in BUILTIN_SEARCHES:
+        for page in range(1, BUILTIN_MAX_PAGES + 1):
+            r = await asyncio.to_thread(httpcloak.get, f"{search}&page={page}", timeout=int(timeout * 1000))
+            await asyncio.sleep(2)
+            if r.status_code != 200:
+                break
+            pages_read += 1
+            cards = r.text.split('data-id="job-card"')[1:]
+            new = 0
+            for card in cards:
+                link = re.search(r'<a href="(/job/[^"]+)"[^>]*data-id="job-card-title"[^>]*>([^<]+)</a>', card)
+                if not link:
+                    continue
+                url, title = "https://builtin.com" + link[1], _html.unescape(link[2]).strip()
+                if url in seen:
+                    continue
+                seen.add(url)
+                new += 1
+                company = re.search(r'data-id="company-title"[^>]*><span>([^<]+)</span>', card)
+                many = re.search(r'data-bs-title="([^"]+)">\s*\d+ Locations', card)
+                if many:
+                    inner = _html.unescape(_html.unescape(many[1]))
+                    place = " | ".join(x.strip() for x in re.findall(r">([^<]+)<", inner) if x.strip())
+                else:
+                    one = re.search(r'fa-location-dot[^>]*></i></div>\s*<div><span[^>]*>([^<]+)</span>', card)
+                    place = _html.unescape(one[1]).strip() if one else ""
+                age = _BUILTIN_AGE.search(card)
+                loc = keep(title, place)
+                if loc is None:
+                    continue
+                out[url] = {"company": _html.unescape(company[1]).strip() if company else "",
+                            "title": title, "location": loc, "url": url,
+                            "posted_at": _builtin_age(age[1]) if age else None}
+            if not cards or not new:
+                break
+    if not pages_read:
+        raise RuntimeError("builtin: no listing page loaded; blocked or the site changed")
     return list(out.values())
 
 
@@ -1408,15 +2789,20 @@ def _turbo_decode(values: list[Any]) -> Any:
     return hyd(0)
 
 
-def _shopify_location(title: str, location: str) -> str:
+def _shopify_location(title: str, location: str, url: str = "") -> str:
     """Shopify is remote-first: most roles say just "Americas", so take the country from
-    the title ("US Software Engineering Internships") when it names one."""
-    if location.lower() != "americas":
-        return location
-    if re.search(r"\b(US|U\.S\.|USA|United States)\b", title):
+    the title ("US Software Engineering Internships") or URL (.../canada-... / ...winter-2027...)."""
+    blob = f"{title} {url}"
+    us_only = re.search(r"\b(US|U\.S\.|USA|United States)\b", blob) and not re.search(
+        r"\bCanada\b", blob, re.I)
+    ca = bool(re.search(r"\b(Canada|Canadian)\b", blob, re.I) or re.search(
+        r"canada-|/canada", url, re.I))
+    if us_only:
         return "Remote - United States"
-    if re.search(r"\b(Canada|Canadian)\b", title, re.I):
+    if ca:
         return "Remote - Canada"
+    if location.lower() != "americas" and location:
+        return location
     return "Remote, Canada / United States"
 
 
@@ -1441,10 +2827,11 @@ async def check_shopify(timeout: float) -> list[dict[str, Any]]:
     for entry in loader["jobPostingsWithJobs"]:
         p = entry.get("jobPosting") or {}
         title = (p.get("title") or "").strip()
-        loc = keep(title, _shopify_location(title, (p.get("locationName") or "").strip()))
+        url = p.get("externalLink") or SHOPIFY_CAREERS
+        loc = keep(title, _shopify_location(title, (p.get("locationName") or "").strip(), url))
         if loc is not None:
             out.append({"company": "Shopify", "title": title, "location": loc,
-                        "url": p.get("externalLink") or SHOPIFY_CAREERS,
+                        "url": url,
                         "posted_at": iso(p.get("publishedDate"))})
     return out
 
@@ -1664,6 +3051,10 @@ async def check_single(source: str, timeout: float) -> list[dict[str, Any]]:
         return await check_jobbank(timeout)
     if source == "remoterocketship":
         return await check_remoterocketship(timeout)
+    if source == "builtin":
+        return await check_builtin(timeout)
+    if source == "simplifyjobs":
+        return await check_simplifyjobs()
     if source == "workopolis":
         return await check_workopolis(timeout)
     if source == "eluta":
@@ -1686,16 +3077,22 @@ async def check_single(source: str, timeout: float) -> list[dict[str, Any]]:
 
 
 def _from_jobs(jobs: list[Any], *, with_company: bool = False) -> list[dict[str, Any]]:
-    out = []
     for j in jobs:
         note_ca_software(j.title, j.location, j.country_iso, str(j.url))
-        loc = keep(j.title, j.location, j.country_iso)
-        if loc is not None:
-            item = {"title": j.title.strip(), "location": loc, "url": str(j.url), "posted_at": iso(j.posted_at)}
-            if with_company:
-                item["company"] = j.company
-            out.append(item)
-    return out
+    token = _SOFTWARE_EMPLOYER.set(True) if _CA_HIRING.get() else None
+    try:
+        out = []
+        for j in jobs:
+            loc = keep(j.title, j.location, j.country_iso)
+            if loc is not None:
+                item = {"title": j.title.strip(), "location": loc, "url": str(j.url), "posted_at": iso(j.posted_at)}
+                if with_company:
+                    item["company"] = j.company
+                out.append(item)
+        return out
+    finally:
+        if token is not None:
+            _SOFTWARE_EMPLOYER.reset(token)
 
 
 # --- dead ATS board → company careers page ---------------------------------------------
@@ -1728,6 +3125,19 @@ def _is_challenge(page: str) -> bool:
 _HREF = re.compile(r"""(?:href|src|data-url)\s*=\s*["']([^"'#\s]+)""", re.I)
 _ANCHOR = re.compile(r"<a\b[^>]*href\s*=\s*[\"']([^\"'#\s]+)[\"'][^>]*>(.*?)</a>", re.I | re.S)
 _GH_EMBED = re.compile(r"greenhouse\.io/embed/job_board(?:/js)?\?for=([A-Za-z0-9_-]+)")
+_NEAR_LOCATION = re.compile(r"(?:map-marker|map-pin|location)[^>]*>\s*(?:</i>|</svg>|</span>)?\s*([^<]{2,80})<",
+                            re.I)
+# Places that clearly aren't the US/Canada, for locations scraped off a page as plain text
+# (an unrecognized one like "Hybrid" or "All locations" stays "location not listed").
+_FOREIGN_PLACE = re.compile(
+    r"\b(india|bengaluru|bangalore|hyderabad|pune|chennai|mumbai|delhi|gurugram|gurgaon|noida|"
+    r"united kingdom|england|london|ireland|dublin|germany|berlin|munich|france|paris|netherlands|"
+    r"amsterdam|spain|madrid|barcelona|portugal|lisbon|porto|italy|poland|warsaw|krakow|romania|ukraine|"
+    r"sweden|denmark|norway|finland|switzerland|zurich|austria|belgium|czech|israel|tel aviv|"
+    r"uae|dubai|singapore|philippines|manila|vietnam|indonesia|malaysia|thailand|china|shanghai|"
+    r"beijing|hong kong|taiwan|japan|tokyo|korea|seoul|australia|sydney|melbourne|new zealand|"
+    r"brazil|sao paulo|são paulo|mexico|argentina|buenos aires|colombia|bogota|bogotá|chile|"
+    r"south africa|nigeria|kenya|egypt|pakistan|bangladesh|sri lanka|emea|apac|latam)\b", re.I)
 _LD_JSON = re.compile(r"<script[^>]+application/ld\+json[^>]*>(.*?)</script>", re.I | re.S)
 _NEXT_DATA = re.compile(r'<script[^>]+id="__NEXT_DATA__"[^>]*>(.*?)</script>', re.S)
 _URL_KEYS = ("absolute_url", "externalLink", "applyLink", "applyUrl", "hostedUrl", "jobUrl", "url")
@@ -1970,13 +3380,23 @@ def _jobs_from_page(page_html: str, base: str) -> list[dict[str, Any]]:
                                                     "posted_at": iso(o.get("datePosted") or o.get("publishedDate"))}
     if out:
         return list(out.values())
-    # Last resort: links whose text reads like a software internship. No location on the
-    # link itself, so it's marked for a look rather than dropped.
-    for href, text in _ANCHOR.findall(page_html):
-        title = _html.unescape(re.sub(r"<[^>]+>|\s+", " ", text)).strip()
-        if 6 < len(title) < 160 and is_software_internship(title):
-            url = urljoin(base, href.replace("&amp;", "&"))
-            out[url] = {"title": title, "location": "location not listed", "url": url, "posted_at": None}
+    # Last resort: links whose text reads like a software internship. Job lists usually show the
+    # location just after the link (JazzHR: <i class='fa fa-map-marker'></i>India); without one
+    # it's marked for a look rather than dropped.
+    anchors = list(_ANCHOR.finditer(page_html))
+    for i, a in enumerate(anchors):
+        title = _html.unescape(re.sub(r"<[^>]+>|\s+", " ", a[2])).strip()
+        if not (6 < len(title) < 160 and is_software_internship(title)):
+            continue
+        url = urljoin(base, a[1].replace("&amp;", "&"))
+        after = page_html[a.end():anchors[i + 1].start() if i + 1 < len(anchors) else a.end() + 800][:800]
+        m = _NEAR_LOCATION.search(after)
+        loc = _html.unescape(re.sub(r"\s+", " ", m[1])).strip() if m else ""
+        label = keep(title, loc) if loc else None
+        if _FOREIGN_PLACE.search(title) and not us_canada(title) or (
+                label is None and loc and _FOREIGN_PLACE.search(loc) and not us_canada(loc)):
+            continue  # listed outside the US/Canada
+        out[url] = {"title": title, "location": label or "location not listed", "url": url, "posted_at": None}
     return list(out.values())
 
 
@@ -2265,6 +3685,7 @@ async def careers_fallback(db: sqlite3.Connection, client: httpx.AsyncClient, ta
         with db:  # self-heal: poll this board directly from the next pass on
             db.execute("UPDATE careers_cache SET ats=?, ats_row=? WHERE company_key=?",
                        (ats, json.dumps(ats_row), company_key))
+        _promote_board(ats, ats_row, company_key)
         if not company_key.startswith(("discover:", "careers:")):
             _log_discovered([datetime.now(UTC).isoformat(timespec="seconds"), ats_row["name"], "",
                              "dead board", "board found via careers page", ats,
@@ -2284,7 +3705,34 @@ async def careers_fallback(db: sqlite3.Connection, client: httpx.AsyncClient, ta
         raise RuntimeError(f"dead board; boards linked from {careers_url} don't work either (queued for web search)")
     if r is None and not page_html:
         raise RuntimeError(f"dead board; careers page {careers_url} did not load")
-    return jobs
+    return await _drop_abroad(client, jobs)
+
+
+_NON_TEXT = re.compile(r"<script(?![^>]*ld\+json)[\s\S]*?</script>|<style[\s\S]*?</style>|<[^>]+>", re.I)
+
+
+async def _drop_abroad(client: httpx.AsyncClient, jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Careers-page jobs with no location: read each job's own page and drop the ones it places
+    only outside the US/Canada. A page that also names a US/Canadian place keeps its job."""
+    import html as _html
+
+    unknown = [j for j in jobs if j["location"] == "location not listed"][:20]
+    if not unknown:
+        return jobs
+    sem = asyncio.Semaphore(4)
+
+    async def abroad(job: dict[str, Any]) -> bool:
+        async with sem:
+            r = await _get_page(client, job["url"])
+        if r is None:
+            return False
+        text = _html.unescape(_NON_TEXT.sub(" ", r.text))
+        return bool(_FOREIGN_PLACE.search(text)) and not (
+            _poll.US_TEXT_RE.search(text) or _poll.CA_TEXT_RE.search(text))
+
+    flags = await asyncio.gather(*(abroad(j) for j in unknown))
+    drop = {j["url"] for j, f in zip(unknown, flags) if f}
+    return [j for j in jobs if j["url"] not in drop]
 
 
 # --- discovery: every company hiring for software roles → its ATS board -----------------
@@ -2385,7 +3833,16 @@ async def _probe_board(client: httpx.AsyncClient, ats: str, slug: str, name: str
             if not _same_company((first.get("company") or {}).get("name", ""), name):
                 return 0
             return int(d.get("totalFound") or 0)
-    except (httpx.HTTPError, ValueError):
+        if ats == "bamboohr":
+            # Fake slugs 200 onto bamboohr.com's marketing HTML. A real tenant returns JSON.
+            r = await client.get(f"https://{slug}.bamboohr.com/careers/list",
+                                 headers={"Accept": "application/json", "X-Requested-With": "XMLHttpRequest"})
+            if r.status_code != 200 or "json" not in r.headers.get("content-type", ""):
+                return 0
+            data = r.json()
+            jobs = data.get("result") if isinstance(data, dict) else None
+            return len(jobs) if isinstance(jobs, list) else 0
+    except (httpx.HTTPError, ValueError, TypeError):
         return 0
     return 0
 
@@ -2403,8 +3860,8 @@ async def _place_company(client: httpx.AsyncClient, name: str, li_slug: str) -> 
         re.sub(r"-(inc|ltd|llc|corp|group|canada|ca|technologies|tech|labs?|hq)$", "", (li_slug or "").lower()),
     ) if s and len(s) >= 3))
     for slug in slugs:
-        for ats in ("greenhouse", "ashby", "lever", "smartrecruiters"):
-            if ats in ("ashby", "lever") and slug.replace("-", "") != _name_slug(name) and slug != (li_slug or "").lower():
+        for ats in ("greenhouse", "ashby", "lever", "smartrecruiters", "bamboohr"):
+            if ats in ("ashby", "lever", "bamboohr") and slug.replace("-", "") != _name_slug(name) and slug != (li_slug or "").lower():
                 continue
             if await _probe_board(client, ats, slug, name) > 0:
                 return ats, slug
@@ -2412,7 +3869,8 @@ async def _place_company(client: httpx.AsyncClient, name: str, li_slug: str) -> 
 
 
 _ATS_ROW_URL = {"greenhouse": "https://job-boards.greenhouse.io/{}", "ashby": "https://jobs.ashbyhq.com/{}",
-                "lever": "https://jobs.lever.co/{}", "smartrecruiters": "https://careers.smartrecruiters.com/{}"}
+                "lever": "https://jobs.lever.co/{}", "smartrecruiters": "https://careers.smartrecruiters.com/{}",
+                "bamboohr": "https://{}.bamboohr.com/careers"}
 
 
 DEAD_BOARDS_CSV = OUT_DIR / "dead_boards.csv"  # source,name,url,moved_to,new_slug
@@ -2749,6 +4207,80 @@ def _append_list_row_raw(ats: str, name: str, row: dict[str, str]) -> None:
             {"name": name, "slug": row.get("slug", ""), "url": row.get("url", ""), "company_name": name})
 
 
+def _promote_board(ats: str, row: dict[str, str], company_key: str = "",
+                   known: set[tuple[str, str]] | None = None,
+                   db: sqlite3.Connection | None = None) -> bool:
+    """Put a board we already proved works onto its ATS list, instead of only caching it
+    for the careers poller. Yahoo/DuckDuckGo never have to find this company again."""
+    if ats not in CONFIGS or not CONFIGS[ats].get("csv") or not (REPO / CONFIGS[ats]["csv"]).exists():
+        return False
+    bid = _board_id_of(ats, row)
+    owned = known if known is not None else _known_boards()
+    if not bid or (ats, bid) in owned:
+        return False
+    name = (row.get("name") or "").strip() or bid
+    name_key = company_key.split(":", 1)[1] if company_key.startswith("discover:") else ""
+    own_db = db is None and bool(name_key)
+    if name_key:
+        if own_db:
+            db = connect()
+        got = db.execute("SELECT name FROM discovered WHERE name_key=?", (name_key,)).fetchone()
+        if got and got[0]:
+            name = got[0]
+    _append_list_row_raw(ats, name, row)
+    owned.add((ats, bid))
+    if name_key and db is not None:
+        with db:
+            db.execute("UPDATE discovered SET status='listed', ats=?, slug=? WHERE name_key=?",
+                       (ats, row.get("slug") or bid, name_key))
+    if own_db and db is not None:
+        db.close()
+    return True
+
+
+def promote_resolved_careers_boards() -> int:
+    """ATS boards the careers poller already found: add them to ats-companies so the
+    3-minute Canada watcher hits the API instead of re-searching the web page."""
+    db = connect()
+    _careers_cache(db)
+    rows = db.execute("SELECT company_key, ats, ats_row FROM careers_cache "
+                      "WHERE ats IS NOT NULL AND ats_row IS NOT NULL").fetchall()
+    known = _known_boards()
+    added = 0
+    for company_key, ats, raw in rows:
+        try:
+            row = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(row, dict):
+            continue
+        if _promote_board(ats, row, company_key, known=known, db=db):
+            added += 1
+    db.close()
+    return added
+
+
+async def _seed_waterloo_if_due(db: sqlite3.Connection, client: httpx.AsyncClient) -> None:
+    """Weekly: UW Engineering + Velocity startups onto the Canada / careers pollers."""
+    last = db.execute("SELECT v FROM discover_state WHERE k='waterloo_seed_at'").fetchone()
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "seed_waterloo", REPO / "scripts" / "seed_waterloo.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        refresh = getattr(mod, "WATERLOO_SEED_REFRESH", 7 * 24 * 60 * 60)
+        if last and time.time() - float(last[0]) < refresh:
+            return
+        uw_html, vel_html = await asyncio.to_thread(mod.fetch_pages)
+        companies = mod.collect_companies(uw_html, vel_html)
+        stats = mod.seed_waterloo_employers(db, companies)
+        write_ca_companies()
+        log_line(f"{'discover':16} Waterloo seed: {stats['total']} employers "
+                 f"({stats['listed']} ATS, {stats['careers']} careers, {stats['queued']} queued)")
+    except Exception as exc:  # noqa: BLE001 — discovery must keep running
+        log_line(f"{'discover':16} Waterloo seed: {exc}")
+
+
 async def run_discover(timeout: float) -> list[dict[str, Any]]:
     import html as _html
 
@@ -2847,6 +4379,8 @@ async def run_discover(timeout: float) -> list[dict[str, Any]]:
 
         # Companies that hired software interns in Canada last season: polled for this season's.
         await refresh_intern_history(db, client)
+        seed_known_ca_intern_employers(db)
+        seed_known_us_intern_employers(db)
         for (company,) in db.execute("SELECT company FROM ca_intern_history").fetchall():
             if not _AGENCY_RE.search(company):
                 note(company, "", "history")
@@ -2856,6 +4390,8 @@ async def run_discover(timeout: float) -> list[dict[str, Any]]:
                                          % ",".join("?" * len(LIST_ORIGINS)), tuple(LIST_ORIGINS)).fetchall():
             if company and loc and _CA_LOCATION.search(loc):
                 note(company, "", "lists")
+
+        await _seed_waterloo_if_due(db, client)
 
         # 2. Place: find each new company's board; the rest go to the web search.
         todo = db.execute("SELECT name_key, name, li_slug, source FROM discovered WHERE status='new' "
@@ -2875,6 +4411,9 @@ async def run_discover(timeout: float) -> list[dict[str, Any]]:
 
         # 3. Harvest: boards that list/LinkedIn job links point to but we don't poll.
         harvested = await harvest_boards(db, client, timeout)
+        promoted = promote_resolved_careers_boards()
+        if promoted:
+            log_line(f"{'discover':16} {promoted} careers-page boards added to ATS lists")
 
         # 4. Repair: find where companies with dead (404) boards moved.
         repaired, moved = await repair_dead_boards(db, client)
@@ -2944,7 +4483,14 @@ def canada_targets() -> list[dict[str, Any]]:
                         (cutoff,)).fetchall()
     # Careers pages that led to a working board: polling them is one API call, no browser.
     resolved = {k for (k,) in db.execute("SELECT company_key FROM careers_cache WHERE ats IS NOT NULL")}
+    extra_names = [n for (n,) in db.execute(
+        "SELECT name FROM discovered WHERE source IN ('waterloo', 'history')")]
+    waterloo_listed = db.execute(
+        "SELECT name, ats, slug FROM discovered WHERE source='waterloo' AND status='listed' "
+        "AND ats IS NOT NULL AND slug IS NOT NULL").fetchall()
     db.close()
+    names.update(norm_text(n or "") for n in extra_names)
+    names.discard("")
 
     by_key: dict[str, dict[str, dict[str, str]]] = {}
     by_name: dict[str, tuple[str, str, dict[str, str]]] = {}
@@ -2980,6 +4526,10 @@ def canada_targets() -> list[dict[str, Any]]:
         if n in by_name:
             src, key, row = by_name[n]
             add(src, key, row.get("name") or key, row)
+    # 4. Waterloo-seeded companies already placed on a known ATS board.
+    for name, ats, slug in waterloo_listed:
+        if ats in by_key and slug in by_key[ats]:
+            add(ats, slug, name or by_key[ats][slug].get("name") or slug, by_key[ats][slug])
     return [targets[k] for k in sorted(targets)]
 
 
@@ -2997,6 +4547,8 @@ PASS_WALL_MAX = 45 * MIN  # kill a pass still running after this (the longest no
 MIN_GAP = {"interndock": 30 * MIN, "cgi": 30 * MIN, "linkedin": 15 * MIN, "workopolis": 30 * MIN,
            "eluta": 60 * MIN,  # reCAPTCHA after a burst; see ELUTA_SEARCHES
            "eightfold": 180 * MIN,  # Eightfold's AWS WAF flags an IP that polls it often
+           "builtin": 20 * MIN,  # ~60 pages a pass
+           "simplifyjobs": 15 * MIN,  # headless browser, up to SIMPLIFYJOBS_MAX_PAGES scrolls
            "wellfound": 30 * MIN}  # 10 browser-rendered pages a pass
 
 
@@ -3024,7 +4576,9 @@ async def run_pass(source: str, max_tenants: int | None, timeout: float, tenant_
     db = connect()
     is_baseline = not baseline_done(db, source)
     stats = {"checked": 0, "found": 0, "new": 0, "errors": 0, "blocked": 0, "careers": 0}
-    # `canada` targets belong to other sources: keep each one's own rate limit, at half its
+    dropped: list[str] = []
+    _DROPPED_INTERNS.set(dropped)
+    # Mixed-host sources (`canada`, `winter`): keep each ATS's own rate limit, at half its
     # usual concurrency since that source's own pass may be hitting the same host.
     src_sems: dict[str, asyncio.Semaphore] = {}
 
@@ -3051,19 +4605,24 @@ async def run_pass(source: str, max_tenants: int | None, timeout: float, tenant_
             return items
 
     def src_sem(target: Any) -> Any:
-        if source != "canada":
+        if source not in MIXED_SOURCES:
             return contextlib.nullcontext()
         src = target["src"]
         if src not in src_sems:
             src_sems[src] = asyncio.Semaphore(max(1, CONCURRENCY.get(src, DEFAULT_CONCURRENCY) // 2))
         return src_sems[src]
 
-    async def one(target: Any, client: httpx.AsyncClient) -> None:
-        async with src_sem(target), sem:
+    # Boards that time out under a full batch's load usually answer in seconds on their own:
+    # retry them once at the end of the pass, a few at a time.
+    timed_out: list[Any] = []
+
+    async def one(target: Any, client: httpx.AsyncClient, limit: asyncio.Semaphore = sem,
+                  last_try: bool = False) -> None:
+        async with src_sem(target), limit:
             hiring: list[tuple[str, str, str]] = []
             _CA_HIRING.set(hiring)
             save_as, baseline, pause = source, is_baseline, delay
-            if source == "canada":
+            if source in MIXED_SOURCES:
                 save_as = target["src"]
                 baseline, pause = not baseline_done(db, save_as), SLOW_DELAY.get(save_as, 0)
             try:
@@ -3075,14 +4634,18 @@ async def run_pass(source: str, max_tenants: int | None, timeout: float, tenant_
                     for it in items:
                         it["company"] = it.get("company") or source
                 else:
-                    if source == "canada":
+                    if source in MIXED_SOURCES:
                         row, company_key, company = target["row"], target["company_key"], target["name"]
                     elif source == "careers":
                         row, company_key, company = target, target["key"], target["name"]
                     else:
                         row, company_key = target, _board_key(target)
                         company = (target.get("name") or "").strip() or company_key
-                    items = await check_board(client, save_as, row, company_key)
+                    emp_token = _SOFTWARE_EMPLOYER.set(_is_ca_software_company(company))
+                    try:
+                        items = await check_board(client, save_as, row, company_key)
+                    finally:
+                        _SOFTWARE_EMPLOYER.reset(emp_token)
                     for it in items:
                         it["company"] = company
                 stats["new"] += save_company(db, save_as, company_key, items, baseline)
@@ -3096,10 +4659,13 @@ async def run_pass(source: str, max_tenants: int | None, timeout: float, tenant_
                     with db:
                         db.execute("DELETE FROM failures WHERE source=? AND company_key=?", (save_as, company_key))
             except Exception as exc:  # noqa: BLE001 — one company never stops a pass
+                if isinstance(exc, TimeoutError) and not single and not last_try:
+                    timed_out.append(target)
+                    return
                 stats["errors"] += 1
                 if not single:
-                    row = target["row"] if source == "canada" else target
-                    key = (target["company_key"] if source == "canada"
+                    row = target["row"] if source in MIXED_SOURCES else target
+                    key = (target["company_key"] if source in MIXED_SOURCES
                            else target.get("key") or _board_key(target))
                     with db:
                         db.execute("INSERT OR REPLACE INTO failures VALUES (?,?,?,?,?,?)",
@@ -3119,6 +4685,10 @@ async def run_pass(source: str, max_tenants: int | None, timeout: float, tenant_
         follow_redirects=True,
     ) as client:
         await asyncio.gather(*(one(t, client) for t in targets))
+        if timed_out:
+            stats["retried"] = len(timed_out)
+            retry_sem = asyncio.Semaphore(max(2, concurrency // 4))
+            await asyncio.gather(*(one(t, client, retry_sem, True) for t in timed_out))
     await close_browser()
     db.close()
     elapsed = time.monotonic() - started
@@ -3128,7 +4698,11 @@ async def run_pass(source: str, max_tenants: int | None, timeout: float, tenant_
              f"{stats['new']} new, {stats['errors']} errors"
              + (f" ({stats['blocked']} rate-limited)" if stats["blocked"] else "")
              + (f", {stats['careers']} via careers page" if stats["careers"] else "")
+             + (f", {stats['retried']} timeouts retried" if stats.get("retried") else "")
              + f" | {elapsed / 60:.1f} min, peak {peak_mb:.0f} MB")
+    if dropped:
+        log_line(f"{source:16}{batch} dropped {len(dropped)} intern-like titles: "
+                 + "; ".join(dropped[:6]))
 
 
 def _peak_rss_mb() -> float:
@@ -3195,6 +4769,28 @@ async def _run_child(source: str, args, offset: int, limit: int | None) -> None:
         log_line(f"{label:16} FAILED (exit {proc.returncode}); see engineering-ats/.status/{source}.log")
 
 
+_csv_running = False
+_csv_again = False
+
+
+async def _write_csv_async() -> None:
+    """write_csv in a thread (it takes 4-10 s and would stall every other source in the group),
+    one at a time; requests that arrive during a write are folded into one more write."""
+    global _csv_running, _csv_again
+    if _csv_running:
+        _csv_again = True
+        return
+    _csv_running = True
+    try:
+        while True:
+            _csv_again = False
+            await asyncio.to_thread(write_csv)
+            if not _csv_again:
+                break
+    finally:
+        _csv_running = False
+
+
 async def _supervise(source: str, interval: float, args, stop_after_one: bool) -> None:
     single = source in SINGLE_SOURCES or source in LIST_SOURCES
     interval = max(interval, MIN_GAP.get(source, 0))  # slow sources: exactly MIN_GAP apart
@@ -3212,10 +4808,10 @@ async def _supervise(source: str, interval: float, args, stop_after_one: bool) -
             async def run_batch(offset: int) -> None:
                 async with side_by_side:
                     await _run_child(source, args, offset, batch)
-                    write_csv()
+                await _write_csv_async()
             await asyncio.gather(*(run_batch(o) for o in range(0, total, batch)))
         mark_baseline_done(source)
-        write_csv()
+        await _write_csv_async()
         if stop_after_one:
             return
         # Next pass `interval` after this one started; right away if the pass ran longer.

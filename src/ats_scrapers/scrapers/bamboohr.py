@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import html
+import json
 import re
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, ClassVar
@@ -47,6 +48,7 @@ from ats_scrapers.scrapers.base import BaseScraper, ScraperRegistry
 if TYPE_CHECKING:
     from ats_scrapers.fetch import Fetcher
 
+LIST_TEMPLATE = "https://{slug}.bamboohr.com/careers/list"
 WIDGET_TEMPLATE = "https://{slug}.bamboohr.com/jobs/embed2.php"
 DETAIL_TEMPLATE = "https://{slug}.bamboohr.com/careers/{id}/detail"
 SHARE_URL_TEMPLATE = "https://{slug}.bamboohr.com/careers/{id}"
@@ -159,10 +161,18 @@ class BambooHRScraper(BaseScraper):
 
     async def afetch(self) -> list[Job]:
         async with self.make_fetcher() as fetch:
+            jobs = await self._fetch_list(fetch)
+            if jobs is not None:
+                if self.include_descriptions and jobs:
+                    await self._enrich_from_detail_api(fetch, jobs)
+                return jobs
             widget_html = await fetch.get_text(
                 WIDGET_TEMPLATE.format(slug=self.company_slug)
             )
-            jobs = self._parse_widget(widget_html)
+            if widget_html.lstrip().startswith("{"):
+                jobs = self._parse_widget_json(json.loads(widget_html))
+            else:
+                jobs = self._parse_widget(widget_html)
             if re.search(r"bhrPositionID_", widget_html, re.IGNORECASE) and not jobs:
                 raise ScraperError(
                     f"BambooHR widget for {self.company_slug} contains jobs "
@@ -171,6 +181,77 @@ class BambooHRScraper(BaseScraper):
             if self.include_descriptions and jobs:
                 await self._enrich_from_detail_api(fetch, jobs)
             return jobs
+
+    async def _fetch_list(self, fetch: Fetcher) -> list[Job] | None:
+        """Jobs from the `/careers/list` JSON (the careers page's own XHR), which
+        carries the country. None when it doesn't answer with that JSON."""
+        try:
+            response = await fetch.request(
+                "GET",
+                LIST_TEMPLATE.format(slug=self.company_slug),
+                headers={"Accept": "application/json", "X-Requested-With": "XMLHttpRequest"},
+                handled=_DETAIL_HANDLED,
+            )
+        except ScraperError:
+            return None
+        if response.status_code != 200:
+            return None
+        try:
+            payload = response.json()
+        except ValueError:
+            return None
+        result = payload.get("result") if isinstance(payload, dict) else None
+        if not isinstance(result, list):
+            return None
+        jobs: list[Job] = []
+        for opening in result:
+            if not isinstance(opening, dict) or not opening.get("id") or not opening.get("jobOpeningName"):
+                continue
+            ats_id = str(opening["id"])
+            loc = opening.get("atsLocation") or {}
+            parts = [loc.get("city"), loc.get("state") or loc.get("province"), loc.get("country")]
+            if not any(parts):
+                loc = opening.get("location") or {}
+                parts = [loc.get("city"), loc.get("state")]
+            location = ", ".join(str(p).strip() for p in parts if p and str(p).strip()) or None
+            remote = str(opening.get("locationType") or "") == "1" or bool(opening.get("isRemote"))
+            if remote:
+                location = f"Remote, {location}" if location else "Remote"
+            job = Job(
+                url=SHARE_URL_TEMPLATE.format(slug=self.company_slug, id=ats_id),
+                title=_strip_tags(str(opening["jobOpeningName"])),
+                company=self.company_slug,
+                ats_type=ATSType.BAMBOOHR,
+                ats_id=ats_id,
+                location=location,
+                department=opening.get("departmentLabel") or None,
+                posted_at=None,
+                fetched_at=datetime.now(UTC),
+            )
+            if remote:
+                job.is_remote = True
+            jobs.append(job)
+        return jobs
+
+    def _parse_widget_json(self, payload: dict) -> list[Job]:
+        jobs: list[Job] = []
+        for dept in payload.get("departments") or []:
+            for pos in dept.get("positions") or []:
+                if not pos.get("id") or not pos.get("name"):
+                    continue
+                ats_id = str(pos["id"])
+                jobs.append(Job(
+                    url=pos.get("url") or SHARE_URL_TEMPLATE.format(slug=self.company_slug, id=ats_id),
+                    title=_strip_tags(str(pos["name"])),
+                    company=self.company_slug,
+                    ats_type=ATSType.BAMBOOHR,
+                    ats_id=ats_id,
+                    location=(pos.get("location") or "").strip() or None,
+                    department=dept.get("label") or None,
+                    posted_at=None,
+                    fetched_at=datetime.now(UTC),
+                ))
+        return jobs
 
     def _parse_widget(self, html: str) -> list[Job]:
         jobs: list[Job] = []

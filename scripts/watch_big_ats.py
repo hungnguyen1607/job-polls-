@@ -23,6 +23,10 @@ SOURCES = [
     "simplify", "speedyapply", "jobright", "zshah101", "earlycareerradar", "applyguy", "ycombinator", "interndock", "negarprh", "hansonchen", "vanshb03", "careers", "remoterocketship",
     # Canadian job boards: Workopolis carries Indeed Canada's postings; Eluta crawls employers' own sites.
     "workopolis", "eluta",
+    # Built In: US/Canadian tech companies post internships there directly.
+    "builtin",
+    # simplify.jobs: the site has many more postings than Simplify's GitHub list.
+    "simplifyjobs",
 ]
 
 if __name__ == "__main__":

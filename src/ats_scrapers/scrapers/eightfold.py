@@ -101,6 +101,10 @@ class EightfoldScraper(BaseScraper):
         # render job URLs on a different one. Default to the API host.
         self.job_url_host = (job_url_host or self.base_url).rstrip("/")
         self.client_kind: ClientKind = client_kind
+        # Search terms; [""] lists every job. Each term is paged through fully and the
+        # results merged, so a few terms cost far fewer requests than a big tenant's full list.
+        self.queries: list[str] = [""]
+        self._query = ""
 
     def get_description(self, job: Job) -> str | None:
         if job.description:
@@ -123,6 +127,14 @@ class EightfoldScraper(BaseScraper):
     # --- async pipeline -------------------------------------------------
 
     async def afetch(self) -> list[Job]:
+        merged: dict[str, Job] = {}
+        for query in self.queries or [""]:
+            self._query = query
+            for job in await self._afetch_query():
+                merged.setdefault(job.ats_id or job.url, job)
+        return list(merged.values())
+
+    async def _afetch_query(self) -> list[Job]:
         seen: set[str] = set()
         all_jobs: list[Job] = []
 
@@ -176,7 +188,7 @@ class EightfoldScraper(BaseScraper):
                 async def get(start: int) -> dict[str, Any]:
                     r = await request.get(
                         f"{self.base_url}/api/pcsx/search",
-                        params={"domain": self.domain, "query": "", "location": "",
+                        params={"domain": self.domain, "query": self._query, "location": "",
                                 "start": start, "sort_by": "timestamp"},
                         timeout=self.timeout * 1000,
                     )
@@ -333,7 +345,7 @@ class EightfoldScraper(BaseScraper):
                     f"{self.base_url}/api/pcsx/search",
                     params={
                         "domain": self.domain,
-                        "query": "",
+                        "query": self._query,
                         "location": "",
                         "start": start,
                         "sort_by": "timestamp",
@@ -409,7 +421,7 @@ class EightfoldScraper(BaseScraper):
                     f"{self.base_url}/api/apply/v2/jobs",
                     params={
                         "domain": self.domain,
-                        "query": "",
+                        "query": self._query,
                         "location": "",
                         "start": start,
                         "sort_by": "timestamp",
@@ -502,7 +514,7 @@ class EightfoldScraper(BaseScraper):
                 f"{self.base_url}/api/pcsx/search",
                 params={
                     "domain": self.domain,
-                    "query": "",
+                    "query": self._query,
                     "location": "",
                     "start": start,
                     "sort_by": "timestamp",
