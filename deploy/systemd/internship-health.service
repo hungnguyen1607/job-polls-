@@ -1,0 +1,11 @@
+[Unit]
+Description=Internship pollers health check + new-internship push
+
+[Service]
+Slice=internship.slice
+EnvironmentFile=-%h/ats-scrapers/.env.server
+Type=oneshot
+WorkingDirectory=%h/ats-scrapers
+ExecStart=%h/ats-scrapers/.venv/bin/python scripts/health_check.py
+StandardOutput=append:%h/ats-scrapers/engineering-ats/health.out
+StandardError=append:%h/ats-scrapers/engineering-ats/health.out

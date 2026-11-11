@@ -1,0 +1,9 @@
+[Unit]
+Description=Budget shared by every internship poller on this server
+
+[Slice]
+# The VPS also runs other apps (Docker stack, AI Tutor): pollers together never take more than this.
+# setup_server.sh rewrites the numbers from the box's free RAM and cores.
+MemoryHigh=4G
+MemoryMax=5G
+CPUQuota=350%

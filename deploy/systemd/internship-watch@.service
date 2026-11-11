@@ -15,6 +15,10 @@ RestartSec=30
 StandardOutput=append:%h/ats-scrapers/engineering-ats/%i.out
 StandardError=append:%h/ats-scrapers/engineering-ats/%i.out
 Nice=5
+# All watchers share one cgroup budget (internship.slice) so the server's other apps keep their RAM.
+Slice=internship.slice
+# MAX_CHILDREN etc. (written by setup_server.sh, sized to the box).
+EnvironmentFile=-%h/ats-scrapers/.env.server
 
 [Install]
 WantedBy=default.target

@@ -1,0 +1,216 @@
+%-------------------------
+% Resume in Latex
+% Author : Jake Gutierrez
+% Based off of: https://github.com/sb2nov/resume
+% License : MIT
+%------------------------
+
+\documentclass[letterpaper,12pt]{article}
+
+\usepackage{latexsym}
+\usepackage[empty]{fullpage}
+\usepackage{titlesec}
+\usepackage{marvosym}
+\usepackage[usenames,dvipsnames]{color}
+\usepackage{verbatim}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+\usepackage{fancyhdr}
+\usepackage[english]{babel}
+\usepackage{tabularx}
+\usepackage{amsmath}
+\input{glyphtounicode}
+
+
+%----------FONT OPTIONS----------
+% sans-serif
+% \usepackage[sfdefault]{FiraSans}
+% \usepackage[sfdefault]{roboto}
+% \usepackage[sfdefault]{noto-sans}
+% \usepackage[default]{sourcesanspro}
+
+% serif
+% \usepackage{CormorantGaramond}
+% \usepackage{charter}
+
+
+\pagestyle{fancy}
+\fancyhf{} % clear all header and footer fields
+\fancyfoot{}
+\renewcommand{\headrulewidth}{0pt}
+\renewcommand{\footrulewidth}{0pt}
+
+% Adjust margins
+\addtolength{\oddsidemargin}{-0.5in}
+\addtolength{\evensidemargin}{-0.5in}
+\addtolength{\textwidth}{1in}
+\addtolength{\topmargin}{-.5in}
+\addtolength{\textheight}{1.3in}
+
+
+\urlstyle{same}
+
+\raggedbottom
+\raggedright
+\setlength{\tabcolsep}{0in}
+
+% Sections formatting
+\titleformat{\section}{
+  \vspace{-4pt}\scshape\raggedright\large
+}{}{0em}{}[\color{black}\titlerule \vspace{-5pt}]
+
+% Ensure that generate pdf is machine readable/ATS parsable
+\pdfgentounicode=1
+
+%-------------------------
+% Custom commands
+\newcommand{\resumeItem}[1]{
+  \item\fontsize{9.7}{11.64}\selectfont{
+    {#1}
+  }
+}
+
+% \sim is a math symbol, so \textbf alone leaves it unbolded
+\newcommand{\bsim}{\ensuremath{\boldsymbol{\sim}}}
+
+\newcommand{\resumeSubheading}[4]{
+  \vspace{-2pt}\item
+    \begin{tabular*}{0.97\textwidth}[t]{l@{\extracolsep{\fill}}r}
+      \textbf{#1} & #2 \\
+      \textit{\small#3} & \textit{\small #4} \\
+    \end{tabular*}\vspace{-3pt}
+}
+
+\newcommand{\resumeSubSubheading}[2]{
+    \item
+    \begin{tabular*}{0.97\textwidth}{l@{\extracolsep{\fill}}r}
+      \textit{\small#1} & \textit{\small #2} \\
+    \end{tabular*}\vspace{-3pt}
+}
+
+\newcommand{\resumeProjectHeading}[2]{
+    \item
+    \begin{tabular*}{0.97\textwidth}{l@{\extracolsep{\fill}}r}
+      \small#1 & #2 \\
+    \end{tabular*}\vspace{-3pt}
+}
+
+\newcommand{\resumeSubItem}[1]{\resumeItem{#1}\vspace{-4pt}}
+
+\renewcommand\labelitemii{$\vcenter{\hbox{\tiny$\bullet$}}$}
+
+\newcommand{\resumeSubHeadingListStart}{\begin{itemize}[leftmargin=0.15in, label={}, itemsep=2pt, parsep=0pt, topsep=1pt, partopsep=0pt]}
+\newcommand{\resumeSubHeadingListEnd}{\end{itemize}}
+\newcommand{\resumeItemListStart}{\begin{itemize}[leftmargin=0.2in,itemsep=0.1cm,parsep=0pt,topsep=8pt,partopsep=0pt]}
+\newcommand{\resumeProjectItemListStart}{\begin{itemize}[leftmargin=0.2in,itemsep=0.1cm,parsep=0pt,topsep=8pt,partopsep=0pt]}
+\newcommand{\resumeItemListEnd}{\end{itemize}\vspace{-5pt}}
+
+%-------------------------------------------
+%%%%%%  RESUME STARTS HERE  %%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+\begin{document}
+
+%----------HEADING----------
+% \begin{tabular*}{\textwidth}{l@{\extracolsep{\fill}}r}
+%   \textbf{\href{http://sourabhbajaj.com/}{\Large Sourabh Bajaj}} & Email : \href{mailto:sourabh@sourabhbajaj.com}{sourabh@sourabhbajaj.com}\\
+%   \href{http://sourabhbajaj.com/}{http://www.sourabhbajaj.com} & Mobile : +1-123-456-7890 \\
+% \end{tabular*}
+
+\begin{center}
+    \textbf{\Huge \scshape Hung Nguyen} \\ \vspace{1pt}
+    \small 613-276-5658 $|$ \href{mailto:h7ng.ng@gmail.com}{\underline{Email}} $|$ 
+    \href{https://www.linkedin.com/in/hunggg/}{\underline{LinkedIn}} $|$
+    \href{https://github.com/hungnguyen1607}{\underline{GitHub}} $|$
+    \href{https://hung-nguyen.ca}{\underline{Personal Website}}
+\end{center}
+
+
+%-----------EDUCATION-----------
+\section{Education}
+  \resumeSubHeadingListStart
+    \resumeSubheading
+      {Concordia University}{Expected May 2028}
+      {Bachelor of Engineering in Software Engineering (Co-op)}{}
+      \vspace{2pt}
+      \begin{itemize}[leftmargin=0.15in, itemsep=0pt, parsep=0pt, topsep=0pt, partopsep=0pt]
+        \item{\fontsize{9}{11}\selectfont \textbf{Relevant Coursework:} Object-Oriented Programming (OOP), Systems Programming}
+      \end{itemize}
+  \resumeSubHeadingListEnd
+\vspace{-12pt}
+
+%-----------EXPERIENCE-----------
+% General full-stack internship resume.
+\section{Experience}
+  \resumeSubHeadingListStart
+
+    \resumeSubheading
+      {Software Engineer Intern}{Sept. 2026 -- Present}
+      {Rakuna}{Remote}
+      \resumeItemListStart
+        \resumeItem{Built a React + Rails dashboard with filters and inline updates, cutting review \textbf{75\%} across \textbf{400+} monthly events}
+        \resumeItem{Shipped \textbf{3} scheduled Rails Slack-webhook reports tracking dropped/bounced/missing emails, saving \textbf{25 hrs/week}}
+        \resumeItem{Cut irrelevant search results \textbf{20\%} by normalizing \textbf{192} free-text majors into canonical IDs via indexed SQL joins}
+        \resumeItem{Wrote \textbf{150+} RSpec regression tests across Rails controllers and models, reducing production bugs by \textbf{25\%}}
+      \resumeItemListEnd
+
+    \resumeSubheading
+      {Software Engineer Intern}{May 2026 -- Aug. 2026}
+      {Rakuna}{Hanoi, Vietnam}
+      \resumeItemListStart
+        \resumeItem{Migrated Workday REST $\rightarrow$ SOAP for \textbf{100+} enterprise clients, merging into 1 request, cutting export time \textbf{95\%}}
+        \resumeItem{Built an async pipeline (SQS $\rightarrow$ ECS Fargate $\rightarrow$ S3) zipping \textbf{20K+} resumes/mo, cutting downloads \textbf{10 min} $\rightarrow$ \textbf{45s}}
+        \resumeItem{Cut recruiter email setup \textbf{15 min} $\rightarrow$ \textbf{3s} with Sidekiq + SendGrid jobs processing \textbf{50K+} emails/month}
+        \resumeItem{Refactored repeated JSX into \textbf{5} reusable React components across 10+ pages, removing \bsim\textbf{500} duplicated lines}
+      \resumeItemListEnd
+
+    \resumeSubheading
+      {Software Engineer Intern}{Mar. 2026 -- May 2026}
+      {Innova Museum}{Vancouver, BC}
+      \resumeItemListStart
+        \resumeItem{Rebuilt the Postgres schema into a \textbf{43}-table canonical baseline with \textbf{89} indexes, retiring the legacy schema}
+        \resumeItem{Designed a revenue aggregation API that computes per-event totals in a single query, cutting latency \textbf{1.97s} $\rightarrow$ \textbf{182ms}}
+        \resumeItem{Engineered rate limiting on auth, OTP, and analytics endpoints, capping each IP at \textbf{20} auth attempts/\textbf{15min}}
+        \resumeItem{Architected a Stripe checkout flow with atomic orders, per-ticket HMAC-signed QRs, and refund-time revocation}
+      \resumeItemListEnd
+
+  \resumeSubHeadingListEnd
+
+\vspace{-10pt}
+
+%-----------PROJECTS-----------
+\section{Projects}
+    \resumeSubHeadingListStart
+      \resumeProjectHeading
+          {\textbf{Agentic Apartment Search SaaS}}{\href{https://stoolapartments.shop}{\underline{Website}}}
+          \resumeProjectItemListStart
+            \resumeItem{Built an AI-agent fact pipeline with Java as the trust boundary: MCP proposes facts, a validator rejects bad fields/types/sources, and two-agent consensus verifies them; Kafka + DLQ, p95 \textbf{127ms}}
+            \resumeItem{Built a versioned building/availability read model: Spring Batch imports a \textbf{149K}-building / \textbf{856K}-unit roll into Postgres in \textbf{34-56s}, with O(1) unit/availability reads and trigger-based cache invalidation}
+            \resumeItem{Built a lease-based Postgres work queue with atomic FOR UPDATE SKIP LOCKED claiming, leases, expired-lease recovery, retry budgets, and job dedupe; exactly-once verified under \textbf{20} concurrent claims}
+          \resumeItemListEnd
+      \resumeProjectHeading
+          {\textbf{Distributed Job Polling Engine}}{\href{https://github.com/hungnguyen1607/job-polls-}{\underline{GitHub}}}
+          \resumeProjectItemListStart
+            \resumeItem{Built a C\#/C++ ingestion pipeline over Redis Streams with XACK consumer groups and horizontal workers; a native C ABI dedup core (arena + SimHash) sustains \textbf{\bsim1M} rows/s at \textbf{0.06 MB}/batch}
+            \resumeItem{Architected one-process-per-source pollers with asyncio semaphores, per-ATS concurrency caps, retries/backoff, and systemd cgroup memory limits, sustaining \textbf{\bsim50K} ATS boards without OOMing the host}
+            \resumeItem{Designed a WAL SQLite store with atomic \texttt{os.replace} writes, normalized cross-source dedup (URL + company + title/city), and a 5-min health/alert loop, keeping \textbf{43K+} postings consistent}
+          \resumeItemListEnd
+    \resumeSubHeadingListEnd
+
+
+\vspace{-16pt}
+
+%-----------PROGRAMMING SKILLS-----------
+\section{Technical Skills}
+ \begin{itemize}[leftmargin=0.15in, label={}]
+    \small{\item{
+     \textbf{Languages}{: Rust, Java, Python, TypeScript, SQL, C++, Ruby, JavaScript, HTML/CSS, GraphQL} \\
+     \textbf{Backend/Infra}{: gRPC, Node.js, Spring Boot, FastAPI, Kafka, systemd, Docker, AWS (SQS/ECS/S3), Linux} \\
+     \textbf{Data}{: PostgreSQL, SQLite (WAL), Redis, Elasticsearch, pgvector} \\
+     \textbf{Observability}{: OpenTelemetry, Prometheus, load testing}
+    }}
+ \end{itemize}
+
+
+%-------------------------------------------
+\end{document}

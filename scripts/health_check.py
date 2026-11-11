@@ -37,7 +37,7 @@ WINTER_CSV = OUT / "winter_2027_companies.csv"
 STATE = OUT / ".health_state.json"
 TOPIC_FILE = OUT / ".ntfy_topic"
 HEALTH_LOG = OUT / "health.log"
-GROUPS = ("big_ats", "bigtech", "small_ats", "canada", "outreach")
+GROUPS = ("fast", "big_ats", "bigtech", "small_ats", "canada", "outreach")
 # Sources that run less often than their group (internship_core.MIN_GAP), in minutes.
 MIN_GAP = {"interndock": 30, "cgi": 30, "linkedin": 15, "workopolis": 30, "eluta": 60, "eightfold": 180, "wellfound": 30, "builtin": 20}
 CSV_STALE_MIN = 15

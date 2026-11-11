@@ -1,0 +1,20 @@
+[Unit]
+Description=Continuous LinkedIn sweep for companies hiring software roles in Canada
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Slice=internship.slice
+EnvironmentFile=-%h/ats-scrapers/.env.server
+Type=simple
+WorkingDirectory=%h/ats-scrapers
+# 6 s between pages (~600/h) so LinkedIn keeps serving the internship pollers too.
+ExecStart=%h/ats-scrapers/.venv/bin/python scripts/discover_sweep.py --forever --gap 6
+Restart=always
+RestartSec=60
+StandardOutput=append:%h/ats-scrapers/engineering-ats/discover_sweep.out
+StandardError=append:%h/ats-scrapers/engineering-ats/discover_sweep.out
+Nice=10
+
+[Install]
+WantedBy=default.target

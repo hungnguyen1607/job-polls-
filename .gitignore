@@ -159,3 +159,7 @@ applications/.email_sync.json
 reports/
 research_notes/
 scripts/outreach_contacts.py
+
+# local side projects — kept out of the job-polls repo
+gb-emulator/
+innova_tickets_26/

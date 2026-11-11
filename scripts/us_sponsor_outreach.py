@@ -18,6 +18,7 @@ import re
 import sys
 import time
 import urllib.request
+from datetime import UTC, datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -154,7 +155,13 @@ COMPANIES: list[dict[str, object]] = [
 
 HEADER = ["company", "confidence", "visa_note", "open_now", "blocked", "terms_matched", "term_count",
           "intern_count", "california_count",
-          "example_job", "example_link", "careers_page", "linkedin", "contact"]
+          "example_job", "example_link", "careers_page", "linkedin", "contact",
+          "work_auth", "company_size", "funding_stage", "smb", "ca_interns", "ca_intern_profiles"]
+# Read from the full simplify.jobs JD (best status across the company's US intern postings).
+WORK_AUTH_RANK = {"sponsors": 0, "silent": 1, "authorized": 2}
+SMB_SIZES = {"1-10", "11-50", "51-200", "201-500"}
+SMB_STAGES = re.compile(r"seed|series[ _]?[abc]\b|angel|pre[- _]?seed|early", re.I)
+CA_INTERN_CACHE = core.OUT_DIR / ".ca_intern_evidence.json"
 # US intern cycle: Summer 2027 is the target, not an exclusion (unlike Canada outreach).
 US_TERMS = [
     "Summer 2027", "Fall 2026", "Summer 2026", "Winter 2027", "Spring 2027",
@@ -168,7 +175,10 @@ _BLOCK_NOTE = {
     "no-sponsor": "Intern list or posting says they do not offer visa sponsorship.",
     "citizen": "Intern list or posting requires US citizenship.",
     "clearance": "Intern posting requires a security clearance.",
+    "us-school": "Intern posting requires enrollment at a US school.",
 }
+_WORK_AUTH_BLOCK = {"citizen": "citizen", "clearance": "clearance", "no_sponsor": "no-sponsor",
+                    "us_school": "us-school"}
 _NO_SPONSOR_TEXT = re.compile(
     r"does not (?:offer|provide)(?: visa)? sponsor|"
     r"do not (?:offer|provide)(?: visa)? sponsor|"
@@ -284,6 +294,185 @@ def visa_block_reason(title: str, url: str, sponsorship: str | None = None) -> s
     return None
 
 
+# --- work authorization read from the full job description ------------------------------
+# Order matters: the first match wins. citizen/clearance/no_sponsor/us_school are dead ends for a
+# Concordia student on a J-1; "authorized" is ambiguous (J-1 holders are authorized once the DS-2019
+# is issued), so it stays on the list flagged "ask the recruiter"; "silent" is the target.
+WORK_AUTH_BLOCKED = ("citizen", "clearance", "no_sponsor", "us_school")
+_JD_CITIZEN = re.compile(
+    r"must be an? (?:us|u\.s\.|united states) citizen|"
+    r"(?:us|u\.s\.|united states) citizenship (?:is )?(?:generally |typically )?(?:required|needed|mandatory)(?!\s*:?\s*no\b)|"
+    r"(?:required|requirements?|qualifications?)\s*:?[^.]{0,25}\b(?:us|u\.s\.) citizen(?:ship)?\b|"
+    r"citizenship\s*:\s*(?:this position )?requires? (?:us|u\.s\.)|"
+    r"requires? (?:us|u\.s\.|united states) citizenship|"
+    r"\b(?:us|u\.s\.|united states) persons?\b(?! [a-z]+ under)|\bitar\b|"
+    r"only (?:us|u\.s\.|united states) citizens|(?:us|u\.s\.) citizenship desired|"
+    r"green card holders? only|citizens? (?:or|and) (?:lawful )?permanent residents? only",
+    re.I)
+_JD_CLEARANCE = re.compile(r"\bts/?sci\b|\btop secret\b|\b(?:interim )?secret (?:security )?clearance\b|"
+                           r"(?:active|obtain|maintain|eligib\w+ for) (?:a |an )?(?:us |u\.s\. )?(?:government )?"
+                           r"security clearance", re.I)
+_JD_NO_SPONSOR = re.compile(
+    _NO_SPONSOR_TEXT.pattern + r"|"
+    r"not eligible for (?:visa |immigration |employment )?sponsor|"
+    r"(?:cannot|can ?not|can't) (?:offer |provide |support )?(?:visa |immigration )?sponsor|"
+    r"(?:will not|won't|do not|does not|not) (?:now or in the future )?require (?:visa |immigration |employer )?sponsor|"
+    r"without (?:the need for |requiring |needing )?(?:current or future |now or in the future )?"
+    r"(?:visa |immigration |employer |employment )?sponsor|"
+    r"sponsorship (?:will not|cannot|is not) be (?:provided|offered|available)|"
+    r"not (?:in a position|able) to (?:offer|provide|support) (?:visa |immigration )?sponsor|"
+    r"without [^.]{0,40}sponsorship|"
+    r"\bnot\b[^.]{0,80}\brequire[^.]{0,40}sponsorship|"
+    r"not (?:offer|provide|pursue|support) [^.]{0,30}sponsorship|"
+    r"will not [a-z]+ (?:visa |immigration )?sponsorship|"
+    r"not available for any [^.]{0,20}sponsorship|"
+    r"sponsorship\s*:\s*no\b|"
+    r"(?:unable|not able) to consider [^.]{0,40}(?:student )?visa|"
+    r"not eligible for [^.]{0,20}\b(?:f-?1|j-?1)\b|"
+    r"authori[sz]ed to work for any employer|"
+    r"(?:not|no) (?:provide |offer )?[^.]{0,40}immigration[- ](?:related )?(?:sponsorship|support)|"
+    r"(?:authori[sz]ed|eligible) to work [^.]{0,60}(?:now and|now or|both now and) in the future|"
+    r"\b(?:cpt|opt)\b[^.]{0,40}\b(?:required|only|eligib)|"
+    r"must (?:be eligible for|have) (?:cpt|opt)\b",
+    re.I)
+_JD_US_SCHOOL = re.compile(
+    r"enrolled (?:full[- ]time )?(?:in|at) an? (?:accredited )?(?:us|u\.s\.|united states)[- ]based "
+    r"(?:college|university|school|institution)|"
+    r"enrolled (?:full[- ]time )?(?:in|at) an? (?:accredited )?(?:us|u\.s\.|united states) "
+    r"(?:college|university|school|institution)|"
+    r"attending an? (?:us|u\.s\.|united states) (?:college|university)", re.I)
+_JD_SPONSORS = re.compile(
+    r"(?:visa|immigration) sponsorship (?:is |may be )?(?:available|offered|provided)|"
+    r"(?:will|can|may|are able to|happy to|open to) (?:provide |offer |consider )?(?:visa |immigration )?sponsor(?:ing|ship)?\b|"
+    r"\bj-?1 (?:visa )?(?:sponsorship|support|program)|sponsor[^.]{0,30}\bj-?1\b|handle your j-?1", re.I)
+_JD_AUTHORIZED = re.compile(
+    r"(?:legally |currently )?(?:authori[sz]ed|eligible|permitted|able) to work (?:in|within|for) "
+    r"(?:the )?(?:us|u\.s\.|united states|usa)|"
+    r"(?:us|u\.s\.) work authori[sz]ation|work authori[sz]ation (?:in|for) the (?:us|u\.s\.|united states)",
+    re.I)
+
+
+def work_auth_status(text: str, sponsors_h1b: object = None) -> str:
+    """citizen | clearance | no_sponsor | us_school | sponsors | authorized | silent."""
+    t = re.sub(r"\s+", " ", text or "")
+    if _JD_CITIZEN.search(t):
+        return "citizen"
+    if _JD_CLEARANCE.search(t):
+        return "clearance"
+    if _JD_NO_SPONSOR.search(t):
+        return "no_sponsor"
+    if _JD_US_SCHOOL.search(t):
+        return "us_school"
+    if _JD_SPONSORS.search(t) or sponsors_h1b is True:
+        return "sponsors"
+    if _JD_AUTHORIZED.search(t):
+        return "authorized"
+    return "silent"
+
+
+def _strip_html(s: str) -> str:
+    import html as _html
+    return _html.unescape(re.sub(r"<[^>]+>", " ", s or ""))
+
+
+def _simplify_detail(client, job_id: str) -> dict[str, object] | None:
+    """Fetch one simplify.jobs posting page and pull the JD + company fields out of __NEXT_DATA__."""
+    r = client.get(f"https://simplify.jobs/p/{job_id}")
+    if r.status_code == 404:
+        return {}
+    r.raise_for_status()
+    m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', r.text, re.S)
+    if not m:
+        return None
+    jp = (json.loads(m.group(1)).get("props") or {}).get("pageProps", {}).get("jobPosting") or {}
+    company = (jp.get("job") or {}).get("company") or {}
+    reqs = [*(jp.get("requirements") or []), *(jp.get("additional_requirements") or []),
+            *(jp.get("desirable") or [])]
+    return {"description": _strip_html(jp.get("description") or ""),
+            "requirements": "\n".join(str(x) for x in reqs),
+            "sponsors_h1b": jp.get("sponsors_h1b"), "company_sponsors_h1b": company.get("sponsors_h1b"),
+            "company_linkedin": company.get("linkedin") or "", "company_url": company.get("url") or ""}
+
+
+def enrich_simplify_details(limit: int = 400, gap: float = 1.0) -> int:
+    """Fetch JD text for simplify_jobs rows never enriched (open US rows first) and classify work auth."""
+    import httpx
+
+    db = core.connect()
+    core._simplify_db(db)
+    todo = db.execute("""SELECT id FROM simplify_jobs WHERE detail_at IS NULL AND open=1
+                         ORDER BY country='US' DESC, first_seen DESC LIMIT ?""", (limit,)).fetchall()
+    done = 0
+    ua = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130 Safari/537.36"
+    with httpx.Client(timeout=30, follow_redirects=True, headers={"User-Agent": ua}) as client:
+        for (job_id,) in todo:
+            try:
+                d = _simplify_detail(client, job_id)
+            except Exception as exc:  # noqa: BLE001 — retry this job next run
+                core.log_line(f"{'simplify_detail':16} {job_id}: {exc}")
+                time.sleep(gap * 5)
+                continue
+            if d is None:
+                continue
+            stamp = datetime.now(UTC).isoformat(timespec="seconds")
+            status = work_auth_status(f"{d.get('description', '')}\n{d.get('requirements', '')}",
+                                      d.get("sponsors_h1b")) if d else ""
+            with db:
+                db.execute("""UPDATE simplify_jobs SET detail_at=?, description=?, requirements=?,
+                    sponsors_h1b=?, company_sponsors_h1b=?, company_linkedin=?, company_url=?, work_auth=?
+                    WHERE id=?""",
+                           (stamp, d.get("description", ""), d.get("requirements", ""),
+                            json.dumps(d.get("sponsors_h1b")), json.dumps(d.get("company_sponsors_h1b")),
+                            d.get("company_linkedin", ""), d.get("company_url", ""), status, job_id))
+            done += 1
+            time.sleep(gap)
+    db.close()
+    return done
+
+
+def reclassify_simplify() -> int:
+    """Re-run work_auth_status over stored JDs (after editing the regexes)."""
+    db = core.connect()
+    core._simplify_db(db)
+    rows = db.execute("SELECT id, description, requirements, sponsors_h1b FROM simplify_jobs "
+                      "WHERE detail_at IS NOT NULL AND description IS NOT NULL").fetchall()
+    with db:
+        for job_id, desc, reqs, h1b in rows:
+            db.execute("UPDATE simplify_jobs SET work_auth=? WHERE id=?",
+                       (work_auth_status(f"{desc}\n{reqs}", json.loads(h1b or "null")), job_id))
+    db.close()
+    return len(rows)
+
+
+def is_smb(size: str, stage: str) -> bool:
+    """Small/early company: <= 500 people, or seed through Series C when size is unknown."""
+    if size:
+        return size in SMB_SIZES
+    return bool(stage and SMB_STAGES.search(stage))
+
+
+def simplify_by_url() -> dict[str, dict]:
+    """simplify.jobs/p/<id> -> snapshot row (incl. work_auth read from the JD)."""
+    db = core.connect()
+    core._simplify_db(db)
+    cols = ("id", "company", "title", "locations", "country", "company_size", "funding_stage",
+            "company_linkedin", "company_url", "work_auth", "open")
+    out = {}
+    for row in db.execute(f"SELECT {', '.join(cols)} FROM simplify_jobs"):
+        d = dict(zip(cols, row))
+        out[_norm_url(f"https://simplify.jobs/p/{d['id']}")] = d
+    db.close()
+    return out
+
+
+def load_ca_intern_evidence() -> dict[str, dict]:
+    """company key -> {count, profiles, checked_at} written by find_contacts.py --canadian-interns."""
+    try:
+        return json.loads(CA_INTERN_CACHE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
 def _fetch_json(url: str) -> object:
     req = urllib.request.Request(url, headers={"User-Agent": "ats-scrapers/us-outreach"})
     with urllib.request.urlopen(req, timeout=60) as resp:
@@ -342,6 +531,7 @@ def collect_us_sponsor_companies() -> list[dict[str, str]]:
     """US software-intern employers. Silent visa language stays; explicit no-sponsor drops."""
     by_company: dict[str, dict] = {}
     visa_urls = intern_list_visa_by_url()
+    simplify = simplify_by_url()
 
     def note(company: str, title: str, location: str, url: str, terms: list[str],
              is_open: bool) -> None:
@@ -355,13 +545,16 @@ def collect_us_sponsor_companies() -> list[dict[str, str]]:
         if overlay:
             company = str(overlay["company"])
             key = core.dedup_key(company)
-        blocked = None if overlay else visa_block_reason(
-            title, url, visa_urls.get(_norm_url(url)))
+        sj = simplify.get(_norm_url(url))
+        blocked = None if overlay else (_WORK_AUTH_BLOCK.get((sj or {}).get("work_auth") or "")
+                                        or visa_block_reason(title, url, visa_urls.get(_norm_url(url))))
         slot = by_company.setdefault(key, {
             "name": company, "terms": {}, "open": False,
             "open_job": None, "any_job": None,
-            "clean": False, "blocked": "",
+            "clean": False, "blocked": "", "auth": set(),
         })
+        if sj and sj.get("work_auth") and not blocked:
+            slot["auth"].add(sj["work_auth"])
         job = (title, location, url)
         keep = [t for t in terms if t in US_TERM_RANK]
         if blocked:
@@ -416,6 +609,19 @@ def collect_us_sponsor_companies() -> list[dict[str, str]]:
     note_csv(core.US_CSV_PATH)
     note_csv(core.ALL_CSV_PATH)
 
+    # Every open US software internship on simplify.jobs, straight from the snapshot table.
+    for u_url, sj in simplify.items():
+        if sj["country"] == "US" and sj["open"]:
+            note_live(sj["company"], sj["title"], sj["locations"] or "United States", u_url, None, True)
+    sj_company: dict[str, dict] = {}
+    for sj in simplify.values():
+        k = core.dedup_key(core.outreach_company_name(sj["company"]))
+        cur = sj_company.setdefault(k, {})
+        for f in ("company_size", "funding_stage", "company_linkedin", "company_url"):
+            if sj.get(f) and not cur.get(f):
+                cur[f] = sj[f]
+    ca_interns = load_ca_intern_evidence()
+
     db = core.connect()
     core._swe_intern_history_table(db)
     core.seed_known_us_intern_employers(db)
@@ -464,6 +670,9 @@ def collect_us_sponsor_companies() -> list[dict[str, str]]:
             company = str(overlay["company"])
         blocked = "" if overlay or slot["clean"] else (slot.get("blocked") or "")
         visa_note = str(overlay["visa_note"]) if overlay else (_BLOCK_NOTE.get(blocked) or "")
+        meta = sj_company.get(key) or sj_company.get(core.dedup_key(company)) or {}
+        auth = min(slot.get("auth") or (), key=lambda a: WORK_AUTH_RANK.get(a, 9), default="")
+        ev = ca_interns.get(core.dedup_key(company)) or {}
         intern_n, intern_ca = core.intern_volume_for(company, stats, region="US")
         if core.is_california_place(loc, title):
             intern_ca = max(intern_ca, 1)
@@ -479,9 +688,17 @@ def collect_us_sponsor_companies() -> list[dict[str, str]]:
             "california_count": str(intern_ca),
             "example_job": f"{title} ({loc})" if title and loc else title,
             "example_link": url or "",
-            "careers_page": (str(overlay.get("careers_page") or "") if overlay else "") or careers.get(key, ""),
-            "linkedin": (str(overlay.get("linkedin") or "") if overlay else "") or linkedin.get(key, ""),
+            "careers_page": ((str(overlay.get("careers_page") or "") if overlay else "") or careers.get(key, "")
+                             or meta.get("company_url", "")),
+            "linkedin": ((str(overlay.get("linkedin") or "") if overlay else "") or linkedin.get(key, "")
+                         or meta.get("company_linkedin", "")),
             "contact": str(overlay.get("contact") or "") if overlay else "",
+            "work_auth": "" if blocked else auth,
+            "company_size": meta.get("company_size", ""),
+            "funding_stage": meta.get("funding_stage", ""),
+            "smb": "yes" if is_smb(meta.get("company_size", ""), meta.get("funding_stage", "")) else "",
+            "ca_interns": str(ev.get("count", "")) if ev else "",
+            "ca_intern_profiles": " ".join(ev.get("profiles", [])[:3]) if ev else "",
         })
 
     # Curated J-1 firms with no US intern posting in sqlite still belong on the list.
@@ -504,6 +721,8 @@ def collect_us_sponsor_companies() -> list[dict[str, str]]:
             "careers_page": str(entry.get("careers_page") or ""),
             "linkedin": str(entry.get("linkedin") or ""),
             "contact": str(entry.get("contact") or ""),
+            "work_auth": "", "company_size": "", "funding_stage": "", "smb": "",
+            "ca_interns": "", "ca_intern_profiles": "",
         })
 
     rows.sort(key=lambda r: (
@@ -522,6 +741,16 @@ def write_us_sponsor_companies() -> int:
 
 
 def main() -> None:
+    import argparse
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--enrich", type=int, default=0, metavar="N",
+                    help="first read the JD of up to N new simplify.jobs postings (work-auth status)")
+    ap.add_argument("--reclassify", action="store_true", help="re-run the work-auth regexes on stored JDs")
+    args = ap.parse_args()
+    if args.reclassify:
+        print(f"reclassified {reclassify_simplify()} postings")
+    if args.enrich:
+        print(f"read {enrich_simplify_details(limit=args.enrich)} new JDs")
     rows = collect_us_sponsor_companies()
     core.OUT_DIR.mkdir(exist_ok=True)
     core._write_rows(core.US_SPONSOR_CSV, HEADER, [[r[h] for h in HEADER] for r in rows])

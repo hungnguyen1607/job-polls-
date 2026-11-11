@@ -2406,12 +2406,18 @@ async def check_remoterocketship(timeout: float) -> list[dict[str, Any]]:
     return list(out.values())
 
 
-# simplify.jobs carries far more postings than Simplify's GitHub list. The page is rendered
-# in JavaScript, so load it in a plain headless browser (sorted by most recently updated)
-# and read the job data the page loads as it scrolls.
+# simplify.jobs carries far more postings than Simplify's GitHub list. Its search is a Typesense
+# `multi_search` that needs a short-lived scoped key, which the page sends itself. So load the page
+# once in a headless browser to read that key, then page through every US + Canadian software
+# internship over plain HTTP (250 a page). Each run is a full snapshot, not just the newest jobs.
 SIMPLIFYJOBS_URL = "https://simplify.jobs/jobs?type=Internship&functions=Software+Engineering&sort=updated"
-SIMPLIFYJOBS_MAX_PAGES = 40  # 21 jobs a page
-SIMPLIFYJOBS_HOURS = 48  # stop scrolling once the page reaches jobs updated longer ago than this
+SIMPLIFYJOBS_SEARCH = "https://js-ha.simplify.jobs/multi_search?use_cache=true&cache_ttl=120"
+SIMPLIFYJOBS_FUNCTIONS = ("Software Engineering", "Full-Stack Engineering", "Backend Engineering",
+                          "Frontend Engineering", "DevOps Engineering", "Systems Software Engineering")
+SIMPLIFYJOBS_FILTER = ("type:=[`Internship`] && functions:=[" + ", ".join(f"`{f}`" for f in SIMPLIFYJOBS_FUNCTIONS)
+                       + "] && physical_countries:=[`United States`, `Canada`]")
+SIMPLIFYJOBS_PER_PAGE = 250
+SIMPLIFYJOBS_MAX_PAGES = 40
 
 
 def _headless_chromium() -> str | None:
@@ -2422,52 +2428,116 @@ def _headless_chromium() -> str | None:
     return found[-1] if found else None
 
 
-async def check_simplifyjobs() -> list[dict[str, Any]]:
-    """US/Canadian software internships on simplify.jobs, newest first."""
+async def _simplify_search_headers() -> dict[str, str]:
+    """Load simplify.jobs once and return the headers (incl. the scoped Typesense key) its search sends."""
     from playwright.async_api import async_playwright
 
-    docs: dict[str, dict[str, Any]] = {}
-    oldest = [time.time()]
+    found: dict[str, str] = {}
 
-    async def on_response(r: Any) -> None:
-        if "multi_search" not in r.url:
-            return
-        try:
-            data = json.loads(await r.text())
-        except Exception:  # noqa: BLE001 — a response we can't read just adds nothing
-            return
-        for res in data.get("results") or []:
-            for hit in res.get("hits") or []:
-                d = hit.get("document") or {}
-                if d.get("id"):
-                    docs[d["id"]] = d
-                    oldest[0] = min(oldest[0], d.get("updated_date") or oldest[0])
+    async def on_request(r: Any) -> None:
+        if "multi_search" in r.url and not found:
+            h = await r.all_headers()
+            found.update({k: v for k, v in h.items() if not k.startswith(":")
+                          and k not in ("content-length", "accept-encoding")})
 
     async with async_playwright() as p:
         # The big_ats service runs near its memory limit, where Chromium can take over 30 s to start.
         browser = await p.chromium.launch(executable_path=_headless_chromium(), timeout=120_000)
         try:
             page = await browser.new_page(viewport={"width": 1400, "height": 1000})
-            page.on("response", on_response)
+            page.on("request", on_request)
             await page.goto(SIMPLIFYJOBS_URL, wait_until="domcontentloaded", timeout=120_000)
-            await page.wait_for_timeout(8_000)
-            for _ in range(SIMPLIFYJOBS_MAX_PAGES):
-                if time.time() - oldest[0] > SIMPLIFYJOBS_HOURS * 3600:
+            for _ in range(30):
+                if found:
                     break
-                before = len(docs)
-                await page.mouse.move(400, 600)
-                await page.mouse.wheel(0, 20_000)
-                await page.wait_for_timeout(2_500)
-                if len(docs) == before:
-                    break
+                await page.wait_for_timeout(1_000)
         finally:
             await browser.close()
+    if "x-typesense-api-key" not in found:
+        raise RuntimeError("simplifyjobs: page sent no search key; blocked or the site changed")
+    return found
+
+
+async def simplify_search_all(filter_by: str = SIMPLIFYJOBS_FILTER) -> list[dict[str, Any]]:
+    """Every simplify.jobs search document matching filter_by (newest-updated first)."""
+    headers = await _simplify_search_headers()
+    docs: dict[str, dict[str, Any]] = {}
+    async with httpx.AsyncClient(timeout=60, headers=headers) as client:
+        for page_no in range(1, SIMPLIFYJOBS_MAX_PAGES + 1):
+            body = {"searches": [{"collection": "jobs", "q": "*",
+                                  "query_by": "title,company_name,functions,locations",
+                                  "sort_by": "updated_date:desc,posting_id:desc",
+                                  "page": page_no, "per_page": SIMPLIFYJOBS_PER_PAGE, "filter_by": filter_by}]}
+            r = await client.post(SIMPLIFYJOBS_SEARCH, json=body)
+            r.raise_for_status()
+            res = (r.json().get("results") or [{}])[0]
+            if res.get("error"):
+                raise RuntimeError(f"simplifyjobs: search error {res['error']}")
+            hits = res.get("hits") or []
+            for hit in hits:
+                d = hit.get("document") or {}
+                if d.get("id"):
+                    docs[d["id"]] = d
+            if len(hits) < SIMPLIFYJOBS_PER_PAGE or len(docs) >= (res.get("found") or 0):
+                break
+    return list(docs.values())
+
+
+def _simplify_db(db: sqlite3.Connection) -> None:
+    db.execute("""CREATE TABLE IF NOT EXISTS simplify_jobs (
+        id TEXT PRIMARY KEY, company TEXT, company_id TEXT, title TEXT, locations TEXT, country TEXT,
+        company_size TEXT, funding_stage TEXT, year_founded INTEGER, seasons TEXT, functions TEXT,
+        updated TEXT, first_seen TEXT, last_seen TEXT, open INTEGER,
+        detail_at TEXT, description TEXT, requirements TEXT, sponsors_h1b TEXT,
+        company_sponsors_h1b TEXT, company_linkedin TEXT, company_url TEXT, work_auth TEXT)""")
+
+
+def save_simplify_snapshot(docs: list[dict[str, Any]]) -> int:
+    """Upsert the snapshot into simplify_jobs; jobs missing from it are marked closed. Returns new count."""
+    db = connect()
+    _simplify_db(db)
+    stamp = datetime.now(UTC).isoformat(timespec="seconds")
+    known = {r[0] for r in db.execute("SELECT id FROM simplify_jobs")}
+    new = 0
+    with db:
+        for d in docs:
+            countries = d.get("physical_countries") or []
+            country = ("Canada" if "Canada" in countries else "US") if countries else ""
+            upd = d.get("updated_date")
+            row = (d.get("company_name") or "", d.get("company_id") or "", d.get("title") or "",
+                   " | ".join(d.get("locations") or []), country, d.get("company_size") or "",
+                   d.get("funding_stage") or "", d.get("year_founded"), ", ".join(d.get("seasons") or []),
+                   ", ".join(d.get("functions") or []),
+                   iso(datetime.fromtimestamp(upd, UTC)) if upd else None)
+            if d["id"] in known:
+                db.execute("""UPDATE simplify_jobs SET company=?, company_id=?, title=?, locations=?, country=?,
+                    company_size=?, funding_stage=?, year_founded=?, seasons=?, functions=?, updated=?,
+                    last_seen=?, open=1 WHERE id=?""", (*row, stamp, d["id"]))
+            else:
+                new += 1
+                db.execute("""INSERT INTO simplify_jobs (company, company_id, title, locations, country,
+                    company_size, funding_stage, year_founded, seasons, functions, updated, id,
+                    first_seen, last_seen, open) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)""",
+                           (*row, d["id"], stamp, stamp))
+        if docs:
+            db.execute("UPDATE simplify_jobs SET open=0 WHERE last_seen < ?", (stamp,))
+    db.close()
+    return new
+
+
+async def check_simplifyjobs() -> list[dict[str, Any]]:
+    """Every US/Canadian software internship on simplify.jobs (full snapshot)."""
+    docs = await simplify_search_all()
     if not docs:
         raise RuntimeError("simplifyjobs: no jobs loaded; blocked or the site changed")
+    try:
+        save_simplify_snapshot(docs)
+    except sqlite3.Error as e:  # the outreach table is extra; never lose the postings over it
+        log_line(f"simplifyjobs: snapshot table not saved: {e}")
 
     out: dict[str, dict[str, Any]] = {}
     now = time.time()
-    for d in docs.values():
+    for d in docs:
         countries = d.get("physical_countries") or []
         iso_code = {"United States": "US", "Canada": "CA"}.get(countries[0]) if len(countries) == 1 else None
         loc = keep(d.get("title") or "", " | ".join(d.get("locations") or []) or None, iso_code)
@@ -4091,6 +4161,108 @@ async def company_careers(client: httpx.AsyncClient, name: str, li_slug: str) ->
     return await find_careers_page(client, {"name": name, "slug": li_slug})
 
 
+SITE_UA = "ats-scrapers/careers-finder (personal internship tracker)"
+_CAREERS_LINK = re.compile(r"""<a\b[^>]*?href\s*=\s*["']([^"'#\s]+)["'][^>]*>(.*?)</a>""", re.I | re.S)
+_CAREERS_WORDS = re.compile(r"career|jobs?\b|join[- ]?(us|our|the)|work[- ]with[- ]us|we.re hiring|"
+                            r"open (roles|positions)|emplois?|carri[eè]res?|hiring", re.I)
+
+
+async def _site_page(client: httpx.AsyncClient, url: str) -> httpx.Response | None:
+    """GET a company page with an honest user-agent; HTML 200 only."""
+    try:
+        r = await client.get(url, timeout=12, follow_redirects=True,
+                             headers={"User-Agent": SITE_UA, "Accept": "text/html,application/xhtml+xml"})
+    except (httpx.HTTPError, ValueError):
+        return None
+    return r if r.status_code == 200 and "html" in r.headers.get("content-type", "") else None
+
+
+def website_of(db: sqlite3.Connection, key: str) -> str:
+    """The company's website as a startup source (YC, Getro, Clera, DMZ, PEY, HN) listed it."""
+    try:
+        got = db.execute("SELECT website FROM startup_sources WHERE name_key=? AND website <> '' "
+                         "ORDER BY last_seen DESC LIMIT 1", (key,)).fetchone()
+    except sqlite3.OperationalError:  # startup_sources not created yet
+        return ""
+    return clean_website(got[0]) if got else ""
+
+
+_NOT_COMPANY_SITES = re.compile(r"(^|\.)(getclera|ycombinator|linkedin|getro|wellfound|angel|crunchbase|"
+                                r"facebook|twitter|x|instagram|github|medium|notion|google|simplify)\.(com|co|io|site)$")
+
+
+def clean_website(raw: str | None) -> str:
+    """'www.x.com (http://www.x.com/)' -> 'https://www.x.com'; '' for directory/social pages."""
+    tok = (raw or "").strip().split()[0] if (raw or "").strip() else ""
+    if not tok:
+        return ""
+    if not tok.startswith("http"):
+        tok = "https://" + tok
+    host = urlparse(tok).netloc.lower().removeprefix("www.")
+    if not host or "." not in host or _NOT_COMPANY_SITES.search(host):
+        return ""
+    return tok
+
+
+async def careers_from_website(client: httpx.AsyncClient, website: str,
+                               timeout: float = 20) -> tuple[str, str, dict[str, str]] | None:
+    """Find a company's jobs from its own website, no search engine: an ATS board the homepage or
+    its careers page links to (checked to actually answer), else the careers page itself.
+    Returns ('ats', ats, row) or ('careers', url, {}) or None."""
+    from urllib.parse import urljoin
+    website = clean_website(website)
+    if not website:
+        return None
+    home = await _site_page(client, website)
+    pages: list[httpx.Response] = []
+    if home is not None:
+        pages.append(home)
+        host = (home.url.host or "").removeprefix("www.")
+        links: list[str] = []
+        for raw, text in _CAREERS_LINK.findall(home.text):
+            url = urljoin(str(home.url), raw.replace("&amp;", "&"))
+            if not url.startswith("http"):
+                continue
+            label = re.sub(r"<[^>]+>", " ", text)
+            if _CAREERS_WORDS.search(label) or _CAREERS_WORDS.search(urlparse(url).path):
+                if _ATS_HOSTS.search(url) or (urlparse(url).netloc.lower().removeprefix("www.")).endswith(host):
+                    if url not in links:
+                        links.append(url)
+        for url in links[:2]:
+            r = await _site_page(client, url)
+            if r is not None:
+                pages.append(r)
+    base = str(home.url).rstrip("/") if home is not None else website.rstrip("/")
+    if len(pages) <= 1:  # no careers link on the homepage: try the usual paths
+        for path in ("/careers", "/jobs", "/join-us"):
+            r = await _site_page(client, base + path)
+            if r is not None and _JOB_WORDS.search(r.text):
+                pages.append(r)
+                break
+    for page in pages:
+        for ats, row in _ats_rows_from_page(page.text, str(page.url))[:3]:
+            if ats not in CONFIGS:
+                continue
+            try:
+                await _poll_ats_row(client, ats, {"name": "", **row}, timeout)
+            except Exception:  # noqa: BLE001 — a dead or wrong board: try the next one
+                continue
+            return "ats", ats, row
+    site = (urlparse(base).netloc.lower().removeprefix("www.")).split(":")[0]
+    for page in pages[1:]:
+        u = urlparse(str(page.url))
+        host = u.netloc.lower().removeprefix("www.")
+        on_site = host == site or host.endswith("." + site)
+        segs = [x for x in u.path.split("/") if x]
+        careerish = ((_CAREERS_WORDS.search(u.path) and len(segs) <= 3 and len(segs[-1] if segs else "") <= 30
+                      and not re.search(r"(^|/)(blog|stories|news|posts?|articles?|press|resources)(/|$)", u.path, re.I))
+                     or host.split(".")[0] in _SUBDOMAIN_WORDS - {"www"})
+        if (on_site and careerish and not re.search(r"error|404|not.?found", str(page.url), re.I)
+                and _JOB_WORDS.search(page.text) and not _is_challenge(page.text)):
+            return "careers", str(page.url), {}
+    return None
+
+
 async def resolve_discovered(db: sqlite3.Connection, client: httpx.AsyncClient, known: set[str],
                              key: str, name: str, li_slug: str, via: str) -> str:
     """Put one discovered company where a poller reads it: its ATS list when it has a board on a
@@ -4103,6 +4275,11 @@ async def resolve_discovered(db: sqlite3.Connection, client: httpx.AsyncClient, 
             careers = await company_careers(client, name, li_slug)
         except Exception:  # noqa: BLE001 — LinkedIn blocked: the web search still runs
             careers = None
+    website = website_of(db, key) if not hit and not careers else ""
+    if website:
+        found = await place_from_website(db, client, key, name, li_slug, via, website)
+        if found:
+            return found
     stamp = datetime.now(UTC).isoformat(timespec="seconds")
     with db:
         if hit:
@@ -4129,7 +4306,52 @@ async def resolve_discovered(db: sqlite3.Connection, client: httpx.AsyncClient, 
         if via != "retry":
             db.execute("UPDATE discovered SET status='searching', checked_at=? WHERE name_key=?", (stamp, key))
             _log_discovered([stamp, name, li_slug, via, "queued for web search", "", ""])
+        if website:  # careers_targets() polls the homepage while the search is pending
+            db.execute("UPDATE discovered SET url=? WHERE name_key=? AND (url IS NULL OR url='')", (website, key))
         return "searching"
+
+
+async def place_from_website(db: sqlite3.Connection, client: httpx.AsyncClient, key: str, name: str,
+                             li_slug: str, via: str, website: str) -> str | None:
+    """Place a company from its own website: ATS board -> its list, careers page -> careers poller.
+    Returns 'listed' / 'careers', or None when the site shows neither."""
+    try:
+        found = await careers_from_website(client, website)
+    except Exception:  # noqa: BLE001 — a broken site just stays queued
+        return None
+    if not found:
+        return None
+    stamp = datetime.now(UTC).isoformat(timespec="seconds")
+    kind, what, row = found
+    if kind == "ats":
+        row = {"name": name, **row}
+        if (what, _board_id_of(what, row)) in _known_boards_cached():  # already polled under another name
+            with db:
+                db.execute("UPDATE discovered SET status='listed', ats=?, slug=?, checked_at=? WHERE name_key=?",
+                           (what, row.get("slug") or _board_id_of(what, row), stamp, key))
+        elif not _promote_board(what, row, f"discover:{key}", known=_known_boards_cached(), db=db):
+            return None
+        with db:
+            db.execute("DELETE FROM careers_search_queue WHERE company_key=?", (f"discover:{key}",))
+        _log_discovered([stamp, name, li_slug, via, "added to list (website)", what, row.get("slug", "")])
+        return "listed"
+    with db:
+        db.execute("INSERT OR REPLACE INTO careers_cache VALUES (?,?,?,?,?)", (f"discover:{key}", what, None, None, stamp))
+        db.execute("UPDATE discovered SET status='careers', url=?, checked_at=? WHERE name_key=?", (what, stamp, key))
+        db.execute("DELETE FROM careers_search_queue WHERE company_key=?", (f"discover:{key}",))
+    _log_discovered([stamp, name, li_slug, via, "careers page (website)", "", what])
+    return "careers"
+
+
+_known_boards_cache: set[tuple[str, str]] | None = None
+
+
+def _known_boards_cached() -> set[tuple[str, str]]:
+    """_known_boards() read once per process; _promote_board adds to the same set."""
+    global _known_boards_cache
+    if _known_boards_cache is None:
+        _known_boards_cache = _known_boards()
+    return _known_boards_cache
 
 
 DISCOVER_HARVEST = 40  # unknown boards (from list/LinkedIn job links) tested per pass
@@ -4727,7 +4949,23 @@ def _rss_mb(pid: int) -> float:
 
 # --- a watcher script: one group of sources, each on its own timer -----------------
 
+# Small servers: MAX_CHILDREN=N caps how many pass processes one watcher runs at once
+# (each ~200 MB; big_ats otherwise runs ~30 side by side, ~5 GB). Unset = no cap (laptop).
+_child_slots: asyncio.Semaphore | None = None
+
+
 async def _run_child(source: str, args, offset: int, limit: int | None) -> None:
+    global _child_slots
+    cap = int(os.environ.get("MAX_CHILDREN") or 0)
+    if cap <= 0:
+        return await _run_child_now(source, args, offset, limit)
+    if _child_slots is None:
+        _child_slots = asyncio.Semaphore(cap)
+    async with _child_slots:
+        return await _run_child_now(source, args, offset, limit)
+
+
+async def _run_child_now(source: str, args, offset: int, limit: int | None) -> None:
     status_dir = OUT_DIR / ".status"
     status_dir.mkdir(parents=True, exist_ok=True)
     cmd = [sys.executable, str(Path(__file__).resolve()), "--pass", source,

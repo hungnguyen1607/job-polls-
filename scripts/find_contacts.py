@@ -32,6 +32,7 @@ import os
 import re
 import sys
 import time
+import json
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
@@ -67,22 +68,52 @@ ATS_HOSTS = re.compile(r"(greenhouse|lever|ashbyhq|myworkdayjobs|workday|icims|s
 
 # --- search -------------------------------------------------------------------
 
+_google_dead = False
 DDG_GAP_SECONDS = 8.0  # DuckDuckGo refuses (HTTP 202) at a faster pace
 _last_ddg = 0.0
+
+
+BRAVE_USAGE = REPO / "engineering-ats" / ".brave_usage.json"
+
+
+def _brave_spend() -> None:
+    """Count Brave queries per month and stop at BRAVE_MONTHLY_CAP (default 900, about $4.50
+    on the $5/month plan), so a big run can never go over the budget."""
+    cap = int(os.environ.get("BRAVE_MONTHLY_CAP", "900"))
+    month = datetime.now().strftime("%Y-%m")
+    try:
+        usage = json.loads(BRAVE_USAGE.read_text())
+    except (OSError, ValueError):
+        usage = {}
+    used = int(usage.get(month, 0))
+    if used >= cap:
+        raise SystemExit(f"Brave monthly cap reached ({used}/{cap} queries in {month}); "
+                         "raise BRAVE_MONTHLY_CAP in .env to allow more")
+    usage[month] = used + 1
+    tmp = BRAVE_USAGE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(usage))
+    os.replace(tmp, BRAVE_USAGE)
 
 
 def search(client: httpx.Client, query: str, count: int = 10, page: int = 0) -> list[dict[str, str]]:
     """Google Custom Search, else Brave, else DuckDuckGo (no key; it blocks LinkedIn people
     searches quickly, so a key is the reliable option). `page` 0 = results 1-10."""
+    global _google_dead
     key, cx = os.environ.get("GOOGLE_API_KEY"), os.environ.get("GOOGLE_CSE_ID")
-    if key and cx:
+    if key and cx and not _google_dead:
         r = client.get("https://www.googleapis.com/customsearch/v1",
                        params={"key": key, "cx": cx, "q": query, "num": min(count, 10), "start": 1 + 10 * page})
-        r.raise_for_status()
-        return [{"title": x.get("title", ""), "url": x.get("link", ""), "snippet": x.get("snippet", "")}
-                for x in r.json().get("items", [])]
+        if r.status_code in (400, 403, 429):
+            # Key disabled / quota gone: use Brave or DuckDuckGo for the rest of this run.
+            print(f"Google search refused (HTTP {r.status_code}); falling back to Brave/DuckDuckGo")
+            _google_dead = True
+        else:
+            r.raise_for_status()
+            return [{"title": x.get("title", ""), "url": x.get("link", ""), "snippet": x.get("snippet", "")}
+                    for x in r.json().get("items", [])]
     brave = os.environ.get("BRAVE_API_KEY")
     if brave:
+        _brave_spend()
         r = client.get("https://api.search.brave.com/res/v1/web/search",
                        params={"q": query, "count": count, "offset": page},
                        headers={"X-Subscription-Token": brave, "Accept": "application/json"})
@@ -207,6 +238,112 @@ def make_email(name: str, domain: str, pattern: str | None) -> str:
             .replace("{f}", first[:1]).replace("{l}", last[:1])) + "@" + domain
 
 
+# --- Canadian-school interns at US companies ----------------------------------------
+# Signal that a US company takes interns from Canadian universities. They may be Canadian citizens
+# on TN, so it is evidence the company hires from Canada, not proof it hosts J-1s.
+CA_SCHOOLS = ('"University of Waterloo" OR "University of Toronto" OR McGill OR UBC OR '
+              '"University of British Columbia" OR Concordia OR "Western University" OR "Queen\'s University" '
+              'OR McMaster OR "Simon Fraser" OR "University of Ottawa" OR Carleton OR "Polytechnique Montr"')
+CA_SCHOOL_RE = re.compile(r"waterloo|university of toronto|\buoft\b|u of t|mcgill|\bubc\b|british columbia|"
+                          r"concordia|western university|queen'?s university|mcmaster|simon fraser|\bsfu\b|"
+                          r"university of ottawa|uottawa|carleton|polytechnique|\bets\b|universit[eé] de montr", re.I)
+INTERN_WORD_RE = re.compile(r"\bintern(ship)?\b|\bco-?op\b|\bstagiaire\b", re.I)
+CA_INTERN_CACHE = OUT_DIR / ".ca_intern_evidence.json"
+CA_INTERN_TTL_DAYS = 30
+
+
+def _load_ca_cache() -> dict:
+    import json
+    try:
+        return json.loads(CA_INTERN_CACHE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_ca_cache(cache: dict) -> None:
+    import json
+    tmp = CA_INTERN_CACHE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(cache, indent=1), encoding="utf-8")
+    tmp.replace(CA_INTERN_CACHE)
+
+
+def canadian_intern_targets(limit: int) -> list[str]:
+    """US companies worth checking: JD doesn't block a J-1 student, small companies first, open first."""
+    path = OUT_DIR / "us_sponsor_companies.csv"
+    if not path.exists():
+        return []
+    with path.open(newline="", encoding="utf-8") as fh:
+        rows = [r for r in csv.DictReader(fh)
+                if not r.get("blocked") and r.get("work_auth") in ("silent", "sponsors", "authorized")]
+    rank = {"sponsors": 0, "silent": 1, "authorized": 2}
+    rows.sort(key=lambda r: (r.get("smb") != "yes", not r.get("open_now"), rank.get(r["work_auth"], 9)))
+    return [r["company"] for r in rows][: limit * 3]
+
+
+def _load_dotenv() -> None:
+    """Search keys from the repo's .env (the systemd watchers don't read ~/.bashrc)."""
+    path = REPO / ".env"
+    if not path.exists():
+        return
+    for line in path.read_text().splitlines():
+        if "=" in line and not line.lstrip().startswith("#"):
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+
+def find_canadian_interns(companies: list[str], limit: int, force: bool = False) -> None:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import internship_core as core
+
+    if not os.environ.get("BRAVE_API_KEY"):
+        # Google's key is refused (403) and DuckDuckGo blocks scripted searches, so without a
+        # Brave key every lookup fails. Say so once instead of logging 0 checked forever.
+        print("no search API key: set BRAVE_API_KEY in .env (https://brave.com/search/api/, $5/month plan) "
+              "-- Canadian-intern lookup skipped")
+        return
+
+    cache = _load_ca_cache()
+    now = datetime.now()
+    done = 0
+    with httpx.Client(timeout=20, follow_redirects=True) as client:
+        for company in companies:
+            if done >= limit:
+                break
+            key = core.dedup_key(company)
+            prev = cache.get(key)
+            if prev and not force:
+                try:
+                    if (now - datetime.fromisoformat(prev["checked_at"])).days < CA_INTERN_TTL_DAYS:
+                        continue
+                except (KeyError, ValueError):
+                    pass
+            query = f'site:linkedin.com/in "{company}" (intern OR "co-op" OR internship) ({CA_SCHOOLS})'
+            try:
+                results = search(client, query)
+            except SystemExit as e:  # DuckDuckGo refused: keep what we have, stop for now
+                print(e)
+                break
+            except httpx.HTTPStatusError as e:
+                print(f"{company}: search failed (HTTP {e.response.status_code})")
+                continue
+            except httpx.HTTPError as e:
+                print(f"{company}: search failed ({type(e).__name__})")
+                continue
+            profiles = []
+            for result in results:
+                p = parse_profile(result, company)
+                if p and INTERN_WORD_RE.search(p["text"]) and CA_SCHOOL_RE.search(p["text"]):
+                    profiles.append(p["linkedin_url"])
+            cache[key] = {"company": company, "count": len(profiles), "profiles": profiles[:5],
+                          "checked_at": now.isoformat(timespec="seconds")}
+            _save_ca_cache(cache)
+            done += 1
+            print(f"{company}: {len(profiles)} Canadian-school intern profile(s)")
+            if os.environ.get("BRAVE_API_KEY") or (os.environ.get("GOOGLE_API_KEY") and not _google_dead):
+                time.sleep(1.1)
+    print(f"\nChecked {done} companies -> {CA_INTERN_CACHE.relative_to(REPO)}")
+
+
 # --- main ---------------------------------------------------------------------------
 
 def city_of(location: str) -> str:
@@ -223,6 +360,7 @@ def load_done() -> set[str]:
 
 
 def main() -> None:
+    _load_dotenv()
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--company", help="only internships at this company (substring match)")
     parser.add_argument("--location", help="only internships whose location contains this")
@@ -236,7 +374,15 @@ def main() -> None:
                         help="pick from US_internships.csv instead of canada_internships.csv")
     parser.add_argument("--direct", action="store_true",
                         help="look up --company at --location even if it has no internship posted")
+    parser.add_argument("--canadian-interns", type=int, metavar="N", nargs="?", const=20,
+                        help="look for interns from Canadian schools at N visa-ok US companies "
+                             "(or just --company); results feed the US outreach list")
+    parser.add_argument("--force", action="store_true", help="with --canadian-interns: ignore the 30-day cache")
     args = parser.parse_args()
+    if args.canadian_interns is not None:
+        targets = [args.company] if args.company else canadian_intern_targets(args.canadian_interns)
+        find_canadian_interns(targets, args.canadian_interns if not args.company else 1, force=args.force)
+        return
     if not (args.company or args.new):
         parser.error("pick internships with --company NAME and/or --new N")
 

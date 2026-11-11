@@ -3,7 +3,9 @@
 
 Does not scrape the 5k career pages. Rebuilds as soon as internships or the 5k
 company list change (and at least once a minute). Every hour it also refreshes
-GitHub intern-list history (live lists + season snapshots). Canada: Winter 2027
+GitHub intern-list history (live lists + season snapshots), reads new simplify.jobs JDs for
+work-authorization wording, and once a day pulls YC / HN startups and looks up Canadian-school
+interns at visa-ok US companies (each in its own subprocess). Canada: Winter 2027
 first; dedicated Summer 2027 SWE intern postings are dropped. US: every software
 intern employer seen in the US unless they say no-sponsor/citizen/clearance.
 
@@ -29,6 +31,31 @@ POLL_SECONDS = 5              # how often we look for new internships
 MIN_GAP = 15                  # seconds; don't stack rebuilds
 HISTORY_EVERY = 60 * 60       # GitHub intern-list refresh
 HISTORY_TIMEOUT = 180
+# Slow enrichment jobs, each its own subprocess so rebuilds never wait on them.
+SCRIPTS = Path(__file__).resolve().parent
+EXTRA_JOBS = [  # (name, every seconds, argv)
+    ("simplify_jd", 60 * 60, ["us_sponsor_outreach.py", "--enrich", "400"]),
+    ("startups", 24 * 60 * 60, ["startup_sources.py", "--place", "300"]),
+    ("website_retry", 24 * 60 * 60, ["startup_sources.py", "--retry-searching", "500"]),
+    ("ca_interns", 24 * 60 * 60, ["find_contacts.py", "--canadian-interns", "25"]),
+]
+_extra_last: dict[str, float] = {}
+_extra_proc: dict[str, subprocess.Popen] = {}
+
+
+def _run_extras() -> None:
+    now = time.time()
+    for name, every, argv in EXTRA_JOBS:
+        proc = _extra_proc.get(name)
+        if proc and proc.poll() is None:
+            continue  # still running
+        if now - _extra_last.get(name, 0.0) < every:
+            continue
+        _extra_last[name] = now
+        log = (core.OUT_DIR / f"outreach_{name}.log").open("a")
+        _extra_proc[name] = subprocess.Popen([sys.executable, str(SCRIPTS / argv[0]), *argv[1:]],
+                                             cwd=core.REPO, stdout=log, stderr=subprocess.STDOUT)
+        core.log_line(f"{'outreach':16} started {name}")
 
 
 def _counts() -> tuple[int, int, int]:
@@ -100,6 +127,8 @@ def main() -> None:
     try:
         while True:
             now = time.time()
+            if not args.once:
+                _run_extras()
             history = (now - last_history) >= HISTORY_EVERY
             changed = _inputs_mtime() > last_seen_mtime
             stale = (now - last_rebuild) >= args.interval * 60

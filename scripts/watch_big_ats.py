@@ -18,9 +18,11 @@ from internship_core import run_group  # noqa: E402
 SOURCES = [
     "greenhouse", "workday", "ashby", "lever", "smartrecruiters", "icims", "oracle",
     "successfactors", "rippling", "bamboohr", "jazzhr", "gem",
-    # Backup sources: community internship lists catch unlisted postings (Jane Street,
-    # SpaceX) and companies missing from ats-companies/. Duplicates of ATS rows are dropped.
-    "simplify", "speedyapply", "jobright", "zshah101", "earlycareerradar", "applyguy", "ycombinator", "interndock", "negarprh", "hansonchen", "vanshb03", "careers", "remoterocketship",
+    # Community lists that are slow/low-yield enough to stay on the 10-min cadence.
+    # The cheap, high-yield lists moved to watch_fast.py (3 min).
+    "ycombinator", "interndock",
+    # Careers pages and browser fallbacks for boards that are dead or block API reads.
+    "careers",
     # Canadian job boards: Workopolis carries Indeed Canada's postings; Eluta crawls employers' own sites.
     "workopolis", "eluta",
     # Built In: US/Canadian tech companies post internships there directly.

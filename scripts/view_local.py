@@ -393,6 +393,12 @@ def _us_outreach() -> dict:
                     "careers_page": r.get("careers_page") or "",
                     "linkedin": r.get("linkedin") or "",
                     "contact": r.get("contact") or "",
+                    "work_auth": r.get("work_auth") or "",
+                    "company_size": r.get("company_size") or "",
+                    "funding_stage": r.get("funding_stage") or "",
+                    "smb": r.get("smb") or "",
+                    "ca_interns": r.get("ca_interns") or "",
+                    "ca_intern_profiles": r.get("ca_intern_profiles") or "",
                 }
                 try:
                     import internship_core as core
@@ -448,6 +454,120 @@ def _inject_contact_rows(canada: dict, us: dict, applied: set[str],
 _payload_cache: tuple[float, dict] | None = None
 
 
+def _company_meta() -> dict[str, dict]:
+    """dedup key -> size / funding stage / linkedin from the simplify.jobs snapshot and discovery sources."""
+    out: dict[str, dict] = {}
+    try:
+        import internship_core as core
+        import us_sponsor_outreach as uso
+
+        db = core.connect()
+        core._simplify_db(db)
+        for company, size, stage, li in db.execute(
+                "SELECT company, company_size, funding_stage, company_linkedin FROM simplify_jobs"):
+            k = core.dedup_key(core.outreach_company_name(company or ""))
+            cur = out.setdefault(k, {})
+            for f, v in (("company_size", size), ("funding_stage", stage), ("linkedin", li)):
+                if v and not cur.get(f):
+                    cur[f] = v
+        db.execute("CREATE TABLE IF NOT EXISTS startup_sources (name_key TEXT PRIMARY KEY, name TEXT, "
+                   "via TEXT, website TEXT, linkedin TEXT, team_size TEXT, stage TEXT, location TEXT, "
+                   "note TEXT, first_seen TEXT, last_seen TEXT)")
+        for name, team, stage, li in db.execute(
+                "SELECT name, team_size, stage, linkedin FROM startup_sources"):
+            k = core.dedup_key(core.outreach_company_name(name or ""))
+            cur = out.setdefault(k, {})
+            for f, v in (("company_size", team), ("funding_stage", stage), ("linkedin", li)):
+                if v and not cur.get(f):
+                    cur[f] = v
+        db.close()
+        for cur in out.values():
+            cur["smb"] = "yes" if uso.is_smb(cur.get("company_size", ""), cur.get("funding_stage", "")) else ""
+    except Exception:  # noqa: BLE001 — extra columns only; the lists still load
+        pass
+    return out
+
+
+def _last_intern_dates() -> dict[str, tuple[str, str]]:
+    """dedup key -> (YYYY-MM of the newest software-internship posting seen anywhere, its title)."""
+    out: dict[str, tuple[str, str]] = {}
+    try:
+        import internship_core as core
+
+        db = core.connect()
+        core._simplify_db(db)
+        core._swe_intern_history_table(db)
+        queries = [
+            "SELECT company, title, COALESCE(posted_at, first_seen) FROM postings",
+            "SELECT company, title, posted_at FROM swe_intern_history",
+            "SELECT company, title, posted_at FROM ca_intern_history",
+            "SELECT company, title, COALESCE(updated, first_seen) FROM simplify_jobs",
+        ]
+        for q in queries:
+            try:
+                rows = db.execute(q).fetchall()
+            except Exception:  # noqa: BLE001 — a missing table just adds nothing
+                continue
+            for company, title, when in rows:
+                if not company or not when or not core.is_software_internship(title or ""):
+                    continue
+                k = core.dedup_key(core.outreach_company_name(company))
+                month = str(when)[:7]
+                if k and (k not in out or month > out[k][0]):
+                    out[k] = (month, (title or "")[:80])
+        db.close()
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def _apply_meta(rows: list[dict], meta: dict[str, dict]) -> None:
+    try:
+        import internship_core as core
+    except Exception:  # noqa: BLE001
+        return
+    for r in rows:
+        m = meta.get(core.dedup_key(core.outreach_company_name(r.get("company") or ""))) or {}
+        for f in ("company_size", "funding_stage", "smb"):
+            if m.get(f) and not r.get(f):
+                r[f] = m[f]
+        if m.get("linkedin") and not r.get("linkedin"):
+            r["linkedin"] = m["linkedin"]
+
+
+def _startup_rows(skip: set[str]) -> list[dict]:
+    """YC / HN startups (startup_sources table) not already on the intern lists."""
+    rows: list[dict] = []
+    try:
+        import internship_core as core
+
+        db = core.connect()
+        db.execute("CREATE TABLE IF NOT EXISTS startup_sources (name_key TEXT PRIMARY KEY, name TEXT, "
+                   "via TEXT, website TEXT, linkedin TEXT, team_size TEXT, stage TEXT, location TEXT, "
+                   "note TEXT, first_seen TEXT, last_seen TEXT)")
+        # City/country words any case; province codes only in capitals ("ON", not "on").
+        canada_words = re.compile(r"canada|toronto|montr[eé]al|vancouver|waterloo|ottawa|calgary|edmonton|"
+                                  r"kitchener|qu[eé]bec|halifax|victoria|winnipeg", re.I)
+        canada_codes = re.compile(r"\b(ON|QC|BC|AB|NS|MB|SK|NB)\b")
+        canada = type("CA", (), {"search": staticmethod(lambda t: canada_words.search(t) or canada_codes.search(t))})
+        for name, via, site, li, size, stage, loc, note in db.execute(
+                "SELECT name, via, website, linkedin, team_size, stage, location, note FROM startup_sources"):
+            if core.dedup_key(core.outreach_company_name(name or "")) in skip:
+                continue
+            in_ca = via in ("dmz", "clera", "pey", "waterlooworks", "startupmap", "accelerator") or bool(canada.search(f"{loc} {note}"))
+            rows.append({"company": name, "where": "Canada" if in_ca else "US / remote", "via": via,
+                         "careers_page": site or "", "linkedin": li or "", "company_size": size or "",
+                         "funding_stage": stage or "", "example_job": (loc or "")[:120], "ping_note": note or "",
+                         "intern_hint": "yes" if "intern" in (note or "") else "",
+                         # a16z / Accel portfolios include OpenAI-size companies: not SMB
+                         "smb": "" if size in ("501-1,000", "1,001-5,000", "5,001-10,000", "10,001+") else "yes"})
+        db.close()
+    except Exception:  # noqa: BLE001
+        pass
+    rows.sort(key=lambda r: (r["where"] != "Canada", r["intern_hint"] != "yes", r["company"].lower()))
+    return rows
+
+
 def outreach_payload() -> dict:
     global _payload_cache
     now = time.time()
@@ -462,7 +582,26 @@ def outreach_payload() -> dict:
     us["rows"] = [_rank_outreach_row(r, california_boost=True, applied=applied, store=store)
                   for r in us["rows"]]
     _inject_contact_rows(canada, us, applied, store=store)
-    payload = {"canada": canada, "us": us}
+    meta = _company_meta()
+    _apply_meta(canada["rows"], meta)
+    _apply_meta(us["rows"], meta)
+    last = _last_intern_dates()
+    try:
+        import internship_core as core
+        have = {core.dedup_key(core.outreach_company_name(r.get("company") or ""))
+                for r in canada["rows"] + us["rows"]}
+    except Exception:  # noqa: BLE001
+        have = set()
+    payload = {"canada": canada, "us": us, "startups": {"rows": _startup_rows(have)}}
+    try:
+        import internship_core as core
+        for part in payload.values():
+            for r in part["rows"]:
+                hit = last.get(core.dedup_key(core.outreach_company_name(r.get("company") or "")))
+                if hit:
+                    r["last_intern_month"], r["last_intern_title"] = hit
+    except Exception:  # noqa: BLE001
+        pass
     _payload_cache = (now, payload)
     return payload
 
