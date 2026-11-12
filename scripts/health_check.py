@@ -180,7 +180,21 @@ def check(state: dict) -> list[str]:
                 seen = last[s].strftime("%H:%M") if s in last else "never"
                 problems.append(f"{s} ({g}) hasn't finished a pass since {seen}")
 
-    # 3. The CSV.
+    # 3. Coverage vs Simplify, hourly (~3 s): a speed change that quietly loses postings shows
+    # up here as a recall drop. The alert is kept between runs so it doesn't flap to "Recovered".
+    if time.time() - state.get("coverage_at", 0) >= 3600:
+        state["coverage_at"] = time.time()
+        try:
+            r = subprocess.run([str(REPO / ".venv" / "bin" / "python"), str(REPO / "scripts" / "coverage_report.py"),
+                                "--alert"], capture_output=True, text=True, timeout=600, cwd=str(REPO))
+            state["coverage_alert"] = next((ln for ln in r.stdout.splitlines() if ln.startswith("ALERT")), "") \
+                if r.returncode == 1 else ""
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            log(f"coverage_report failed: {exc}")
+    if state.get("coverage_alert"):
+        problems.append(state["coverage_alert"])
+
+    # 4. The CSV.
     if not CSV_PATH.exists():
         problems.append(f"{CSV_PATH.name} hasn't been written yet")
         return problems

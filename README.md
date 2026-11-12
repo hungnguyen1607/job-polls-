@@ -16,4 +16,15 @@ Outputs land in `engineering-ats/` (`US_internships.csv`, `canada_internships.cs
 
 Beyond live postings, `scripts/watch_outreach.py` + `scripts/build_outreach_tracker.py` build a cold-outreach list of Canadian employers that hire co-ops without a public posting.
 
+## Distributed ingestion (C#/C++)
+
+`distributed/` is a separate ingestion backend that consumes the Python poller's SQLite DB:
+
+- **C# Publisher** tails `engineering-ats/.internships.sqlite` and publishes new postings to **Redis Streams**.
+- **C# Consumers** pull consumer groups, call the native dedup core, and write deduped rows back to SQLite.
+- **C++ core** does allocation-light SimHash near-duplicate detection behind a POD-only C ABI, using a per-batch arena (measured ~1.06M rows/s, 0.06 MB arena for 2,000 rows).
+- **C# API** serves `/api/jobs`, `/api/stats`, `/health`, and an SSE dashboard.
+
+See [`distributed/README.md`](distributed/README.md) for build/run steps and [`distributed/RESULTS.md`](distributed/RESULTS.md) for the measured numbers.
+
 Scrapers come from [ats-scrapers](https://github.com/kalil0321/ats-scrapers) (Kalil Bouzigues); this repo adds the intern filter, concurrent watchers, feed, and UI. MIT licensed.

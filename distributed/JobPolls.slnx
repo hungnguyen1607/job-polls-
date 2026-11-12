@@ -1,0 +1,12 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/JobPolls.Api/JobPolls.Api.csproj" />
+    <Project Path="src/JobPolls.Consumer/JobPolls.Consumer.csproj" />
+    <Project Path="src/JobPolls.Contracts/JobPolls.Contracts.csproj" />
+    <Project Path="src/JobPolls.Native/JobPolls.Native.csproj" />
+    <Project Path="src/JobPolls.Publisher/JobPolls.Publisher.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/JobPolls.Tests/JobPolls.Tests.csproj" />
+  </Folder>
+</Solution>

@@ -8,7 +8,7 @@
   :root { --muted: #6b7280; --line: #eee; }
   * { box-sizing: border-box; }
   body { margin: 0; background: #fff; color: #111; font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-  main { max-width: 1040px; margin: 0 auto; padding: 32px 20px 64px; }
+  main { max-width: 1100px; margin: 0 auto; padding: 32px 20px 64px; }
   h1 { font-size: 20px; font-weight: 600; margin: 0 0 4px; }
   #sub { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
   nav { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
@@ -28,7 +28,7 @@
   td.people a:hover { color: #111; }
   td.n { color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
   td.v { font-size: 12px; white-space: nowrap; }
-  td.v .ok { color: #047857; } td.v .ask { color: #b45309; } td.v a { color: var(--muted); margin-left: 6px; }
+  td.v .ok { color: #047857; } td.v .no { color: #b91c1c; }
   .applied { color: var(--muted); font-size: 12px; font-weight: 400; margin-left: 8px; }
 </style>
 </head>
@@ -38,16 +38,10 @@
   <div id="sub">Loading…</div>
   <nav><a href="/">← Internships</a><a href="/tailor">Tailor resume</a><a href="/tracker">Application tracker</a></nav>
   <div class="bar">
-    <button class="tab on" data-region="ca">Canada small</button>
-    <button class="tab" data-region="small">Small</button>
-    <button class="tab" data-region="sf">SF</button>
-    <button class="tab" data-region="all">All</button>
-    <button class="tab" data-region="canada">Canada</button>
+    <button class="tab on" data-region="canada">Canada</button>
     <button class="tab" data-region="us">US</button>
-    <button class="tab" data-region="usok">US visa-ok</button>
-    <button class="tab" data-region="smb">SMB</button>
-    <button class="tab" data-region="startups">Startups (not posting)</button>
-    <input id="q" type="search" placeholder="Search FreshBooks, Wealthsimple, Composio…" autofocus>
+    <button class="tab" data-region="big5">Big 5</button>
+    <input id="q" type="search" placeholder="Search companies…" autofocus>
   </div>
   <table>
     <thead>
@@ -56,9 +50,9 @@
         <th data-k="where">Where</th>
         <th data-k="last_term">Last intern</th>
         <th data-k="intern_count">Interns</th>
-        <th data-k="company_size">Size</th>
-        <th data-k="work_auth">Visa</th>
-        <th data-k="ping_name">Ping</th>
+        <th data-k="open_now">Open</th>
+        <th data-k="visa">Visa</th>
+        <th data-k="ca_intern_flag">CA interns</th>
         <th>People</th>
       </tr>
     </thead>
@@ -89,95 +83,20 @@
     const eng = slug
       ? `https://www.linkedin.com/company/${encodeURIComponent(slug)}/people/?keywords=${encodeURIComponent(engQ)}`
       : liSearch("people", `"${name}" ("software engineer" OR "software developer")`);
-    const company = slug
-      ? `https://www.linkedin.com/company/${encodeURIComponent(slug)}/`
-      : liSearch("companies", name);
-    // Past + current interns: LinkedIn's global people search matches past positions too
-    // (a company's /people page only lists current employees).
-    const interns = liSearch("people", `"${name}" ("software engineer intern" OR "SWE intern" OR "software developer intern" OR "software engineering intern")`);
-    return { rec, eng, company, interns };
+    return { rec, eng };
   }
 
   const REFRESH_MS = 10_000;
-  let canada = [], us = [], startups = [];
-  let region = "ca", sortKey = "company", sortDir = 1;
-
-  function mergedRows() {
-    const map = new Map();
-    for (const r of canada) map.set(r.company.toLowerCase(), { ...r, where: "Canada" });
-    for (const r of us) {
-      const k = r.company.toLowerCase();
-      const hit = map.get(k);
-      if (hit) {
-        hit.where = "Canada + US";
-        hit.intern_count = Math.max(Number(hit.intern_count) || 0, Number(r.intern_count) || 0);
-        hit.california_count = Math.max(Number(hit.california_count) || 0, Number(r.california_count) || 0);
-        hit.priority = Math.max(Number(hit.priority) || 0, Number(r.priority) || 0);
-        hit.california = hit.california || r.california;
-        hit.open_now = hit.open_now || r.open_now;
-        hit.startup = hit.startup || r.startup;
-        hit.example_job = hit.example_job || r.example_job;
-        hit.example_link = hit.example_link || r.example_link;
-        if (r.applied === "yes") hit.applied = "yes";
-      } else map.set(k, { ...r, where: "US" });
-    }
-    return [...map.values()];
-  }
-
-  function isSmall(r) {
-    const n = Number(r.intern_count) || 0;
-    const blob = `${r.ats || ""} ${r.example_link || ""} ${r.careers_page || ""} ${r.ping_job_link || ""} ${r.ping_note || ""}`.toLowerCase();
-    const board = /ashby|rippling|lever\.co|greenhouse|ycombinator|breezy|wellfound|bamboohr|workable|gem\.com|jazzhr|applytojob/.test(blob);
-    return board || r.startup === "yes" || (r.open_now === "yes" && n <= 12);
-  }
-
-  function isBay(r) {
-    if (r.california === "yes" || Number(r.california_count) > 0) return true;
-    const blob = `${r.example_job || ""} ${r.where || ""} ${r.ping_note || ""} ${r.term || ""}`.toLowerCase();
-    return /san francisco|\bsf\b|bay area|palo alto|mountain view|sunnyvale|menlo park|san mateo|redwood/.test(blob);
-  }
-
-  // US visa-ok: the JD doesn't block a J-1 student (silent / sponsors / "authorized" = ask),
-  // or interns from Canadian schools have worked there.
-  const isVisaOk = (r) => !r.blocked && (["silent", "sponsors", "authorized"].includes(r.work_auth)
-    || Number(r.ca_interns) > 0 || r.confidence);
+  let canada = [], us = [], big5 = [];
+  let region = "canada", sortKey = "last_term", sortDir = 1;
 
   function rowsFor() {
-    if (region === "canada") return canada.map((r) => ({ ...r, where: "Canada" }));
-    if (region === "us") return us.filter((r) => !r.blocked).map((r) => ({ ...r, where: "US" }));
-    if (region === "startups") return startups;
-    if (region === "usok") return us.filter(isVisaOk).map((r) => ({ ...r, where: "US" }));
-    if (region === "smb") {
-      return [...canada.filter((r) => r.smb === "yes").map((r) => ({ ...r, where: "Canada" })),
-              ...us.filter((r) => r.smb === "yes" && isVisaOk(r)).map((r) => ({ ...r, where: "US" }))];
-    }
-    const all = mergedRows().filter((r) => !r.blocked);
-    if (region === "small") return all.filter((r) => isSmall(r) || r.smb === "yes");
-    if (region === "sf") return all.filter((r) => isSmall(r) && isBay(r));
-    if (region === "ca") {
-      return canada.map((r) => ({ ...r, where: "Canada" })).filter(isSmall);
-    }
-    return all;
+    if (region === "us") return us;
+    if (region === "big5") return big5;
+    return canada;
   }
 
-  function val(r, k) {
-    if (k === "priority" || k === "intern_count") return Number(r[k]) || 0;
-    if (k === "work_auth") return ({ sponsors: "0", silent: "1", authorized: "2" })[r.work_auth] || (Number(r.ca_interns) > 0 ? "3" : "9");
-    if (k === "last_term") return termRank(r);
-    if (k === "company_size") return SIZE_ORDER.indexOf(r.company_size) < 0 ? 99 : SIZE_ORDER.indexOf(r.company_size);
-    return String(r[k] || "");
-  }
-
-  function whereLabel(r) {
-    const w = r.where || "";
-    if (w.includes("US") && (r.california === "yes" || Number(r.california_count) > 0)) {
-      return w.includes("CA") ? w : `${w} · CA`;
-    }
-    return w;
-  }
-
-  // Most recent intern term a company posted, newest first. "Open" = has an intern posting open now.
-  const TERM_ORDER = ["Fall 2027", "Summer 2027", "Spring 2027", "Winter 2027", "Fall 2026", "Summer 2026",
+  const TERM_ORDER = ["Winter 2027", "Spring 2027", "Summer 2027", "Fall 2027", "Fall 2026", "Summer 2026",
                       "Spring 2026", "Winter 2026", "Fall 2025", "Summer 2025", "Winter 2025"];
   function lastTerm(r) {
     const terms = String(r.term || "").split(/\s*,\s*/).filter(Boolean);
@@ -189,34 +108,29 @@
   }
   const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
   const monthLabel = (ym) => { const [y, m] = String(ym).split("-"); return `${MONTHS[Number(m) - 1] || ""} ${y}`.trim(); };
-  // Sort: open now, then named terms newest first, then by newest posting month, then never seen.
   const termRank = (r) => {
     const t = lastTerm(r);
-    if (t === "open now") return -1;
     if (TERM_ORDER.includes(t)) return TERM_ORDER.indexOf(t);
-    if (r.last_intern_month) return 100 + (300000 - Number(String(r.last_intern_month).replace("-", ""))) / 1000;
+    if (t === "open now") return 100;
+    if (r.last_intern_month) return 200 + (300000 - Number(String(r.last_intern_month).replace("-", ""))) / 1000;
     return 9999;
   };
 
-  const SIZE_ORDER = ["1-10", "11-50", "51-200", "201-500", "501-1,000", "1,001-5,000", "5,001-10,000", "10,001+"];
-
-  function visaCell(r) {
-    if (r.via) return r.intern_hint === "yes" ? `<span class="ok">mentions interns</span>` : `<span class="m">${esc(r.via.toUpperCase())}</span>`;
-    if (r.where === "Canada") return "";
-    const label = { sponsors: ["ok", "sponsors"], silent: ["ok", "JD silent"], authorized: ["ask", "ask: 'authorized'"] }[r.work_auth];
-    const tag = label ? `<span class="${label[0]}">${label[1]}</span>` : (r.confidence ? `<span class="ok">J-1 ${esc(r.confidence)}</span>` : "");
-    const profiles = String(r.ca_intern_profiles || "").split(/\s+/).filter(Boolean);
-    const ev = Number(r.ca_interns) > 0
-      ? `<a href="${esc(profiles[0] || "#")}" target="_blank" rel="noopener" title="Interns from Canadian schools (may be Canadian citizens on TN, not proof of J-1)">${r.ca_interns} CA interns</a>`
-      : (r.ca_interns === "0" ? `<span class="m">0 CA interns found</span>` : `<span class="m" title="Canadian-intern lookup needs BRAVE_API_KEY">CA interns: not checked</span>`);
-    return `${tag}${ev}`;
+  function val(r, k) {
+    if (k === "intern_count") return Number(r[k]) || 0;
+    if (k === "last_term") return termRank(r);
+    if (k === "open_now") return r.open_now === "yes" ? 0 : 1;
+    if (k === "visa") return r.visa === "sponsor" ? 0 : 1;
+    if (k === "ca_intern_flag") return r.ca_intern_flag === "yes" ? 0 : 1;
+    return String(r[k] || "");
   }
 
   function render() {
     const q = $("#q").value.trim().toLowerCase();
-    let shown = rowsFor().filter((r) => {
+    const all = rowsFor();
+    let shown = all.filter((r) => {
       if (!q) return true;
-      const blob = `${r.company} ${r.example_job || ""} ${r.term || ""} ${r.ping_name || ""} ${r.ping_note || ""} ${r.where || ""}`.toLowerCase();
+      const blob = `${r.company || ""} ${r.example_job || ""} ${r.term || ""} ${r.where || ""}`.toLowerCase();
       return blob.includes(q);
     });
     shown = shown.slice().sort((a, b) => {
@@ -226,60 +140,51 @@
     });
     $("#rows").innerHTML = shown.map((r) => {
       const p = peopleLinks(r);
-      const mail = r.contact
-        ? `<a href="mailto:${esc(r.contact)}">${esc(r.contact)}</a>`
-        : "";
-      const pingHref = r.ping_linkedin || (r.contact ? `mailto:${r.contact}` : "");
-      const ping = r.ping_name
-        ? (pingHref
-          ? `<a class="rec" href="${esc(pingHref)}" target="_blank" rel="noopener" title="${esc(r.ping_title || r.ping_note || "")}">${esc(r.ping_name)}</a>`
-          : `<span class="rec" title="${esc(r.ping_title || r.ping_note || "")}">${esc(r.ping_name)}</span>`)
-        : `<span class="m">—</span>`;
-      const job = r.ping_job_link
-        ? `<a href="${esc(r.ping_job_link)}" target="_blank" rel="noopener">Job</a>`
-        : r.via && r.careers_page ? `<a href="${esc(r.careers_page)}" target="_blank" rel="noopener">Site</a>` : "";
-      const hn = r.via === "hn" ? (String(r.ping_note).match(/https:\/\/news\.ycombinator\.com\/item\?id=\d+/) || [""])[0] : "";
-      const src = hn ? `<a href="${esc(hn)}" target="_blank" rel="noopener">HN post</a>` : "";
       const applied = r.applied === "yes" ? `<span class="applied">applied</span>` : "";
+      const job = r.example_link
+        ? `<a class="rec" href="${esc(r.example_link)}" target="_blank" rel="noopener">Job</a>`
+        : r.careers_page ? `<a class="rec" href="${esc(r.careers_page)}" target="_blank" rel="noopener">Site</a>` : "";
+      const visa = region === "us"
+        ? (r.visa === "sponsor" ? `<span class="ok">sponsor</span>` : `<span class="no">no-sponsor</span>`)
+        : "";
+      const ca = region === "us" && r.ca_intern_flag === "yes" ? `<span class="ok">yes</span>` : "";
       return `<tr>
-        <td><a href="${esc(p.company)}" target="_blank" rel="noopener">${esc(r.company)}</a>${applied}</td>
-        <td class="m">${esc(whereLabel(r))}</td>
+        <td><a href="${esc(p.rec)}" target="_blank" rel="noopener">${esc(r.company)}</a>${applied}</td>
+        <td class="m">${esc(r.where || "")}</td>
         <td class="n" title="${esc(r.last_intern_title || "")}">${esc(lastTerm(r))}${r.open_now === "yes" && lastTerm(r) !== "open now" ? " · open" : ""}</td>
         <td class="n">${r.intern_count || ""}</td>
-        <td class="n" title="${esc(r.funding_stage || "")}">${esc(r.company_size || "")}</td>
-        <td class="v">${visaCell(r)}</td>
-        <td class="people">${ping}</td>
+        <td class="n">${r.open_now === "yes" ? "open" : ""}</td>
+        <td class="v">${visa}</td>
+        <td class="v">${ca}</td>
         <td class="people">
-          ${String(r.where || "").includes("US") ? `<a class="rec" href="${esc(p.interns)}" target="_blank" rel="noopener" title="People who interned there: check their schools for Canadian students">SWE Intern @ ${esc(r.company)}</a>` : ""}
           <a class="rec" href="${esc(p.rec)}" target="_blank" rel="noopener">Recruiters</a>
           <a href="${esc(p.eng)}" target="_blank" rel="noopener">Engineers</a>
           ${job}
-          ${src}
-          ${mail}
         </td>
       </tr>`;
     }).join("") || `<tr><td class="m" colspan="8">No companies</td></tr>`;
-    const n = rowsFor().length;
-    const label = region === "small"
-      ? "small ATS shops (Ashby / Rippling / Lever / BambooHR / open intern)"
-      : region === "sf" ? "SF / Bay Area small intern shops (Composio class)"
-      : region === "ca" ? "Canadian startups / small intern shops (FreshBooks class)"
-      : region === "usok" ? "US intern employers whose JD doesn't block a J-1 student (or with Canadian-school interns)"
-      : region === "startups" ? "small YC / HN startups hiring engineers, no intern history yet (Canada first, then HN posts mentioning interns)"
-      : region === "smb" ? "small companies (≤500 people or seed–Series C); US ones visa-ok only"
-      : region === "all" ? "SWE intern employers (open or closed)"
-      : `${region === "us" ? "US" : "Canadian"} SWE intern employers`;
-    $("#sub").textContent = q
-      ? `${shown.length} of ${n} ${label}`
-      : `${n} ${label}. Search a name, then Recruiters.`;
+    const n = all.length;
+    const label = region === "us" ? "US intern employers"
+      : region === "big5" ? "companies hiring through the Big 5"
+      : "companies with a Canadian office";
+    $("#sub").textContent = q ? `${shown.length} of ${n} ${label}` : `${n} ${label}.`;
   }
 
   async function load() {
-    const data = await fetch("/api/outreach", { cache: "no-store" }).then((r) => r.json()).catch(() => ({}));
-    canada = data.canada?.rows || [];
-    us = data.us?.rows || [];
-    startups = data.startups?.rows || [];
-    render();
+    try {
+      const res = await fetch("/api/outreach", { cache: "no-store" });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      if (data.canada?.rows?.length) canada = data.canada.rows;
+      if (data.us?.rows?.length) us = data.us.rows;
+      if (data.big5?.rows?.length) big5 = data.big5.rows;
+      render();
+    } catch (e) {
+      // Keep the last good lists; a rebuild can take ~10 s and reset the request.
+      if (!canada.length && !us.length && !big5.length) {
+        $("#sub").textContent = "Loading… (server busy, retrying)";
+      }
+    }
   }
 
   document.querySelectorAll("[data-region]").forEach((b) => b.addEventListener("click", () => {
@@ -292,7 +197,7 @@
   document.querySelector("table").addEventListener("click", (e) => {
     const k = e.target.dataset.k;
     if (!k) return;
-    sortDir = k === sortKey ? -sortDir : (["company", "where", "last_term", "company_size", "work_auth"].includes(k) ? 1 : -1);
+    sortDir = k === sortKey ? -sortDir : (["company", "where", "last_term", "open_now", "visa", "ca_intern_flag"].includes(k) ? 1 : -1);
     sortKey = k;
     render();
   });

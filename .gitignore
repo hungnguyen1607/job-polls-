@@ -163,3 +163,12 @@ scripts/outreach_contacts.py
 # local side projects — kept out of the job-polls repo
 gb-emulator/
 innova_tickets_26/
+
+# distributed C#/C++ build outputs
+distributed/**/bin/
+distributed/**/obj/
+distributed/native/build/
+distributed/**/*.db
+
+# personal resumes (were tracked before the repo went public)
+Hung*Resume.*

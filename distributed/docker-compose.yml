@@ -1,0 +1,48 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  consumer:
+    build:
+      context: .
+      target: consumer
+    environment:
+      - JOBPOLLS_REDIS=redis:6379
+      - JOBPOLLS_STORE=/data/consumer.db
+    volumes:
+      - consumer-data:/data
+    depends_on:
+      - redis
+    deploy:
+      replicas: 4
+
+  api:
+    build:
+      context: .
+      target: api
+    environment:
+      - JOBPOLLS_REDIS=redis:6379
+      - JOBPOLLS_STORE=/data/consumer.db
+    ports:
+      - "5000:8080"
+    volumes:
+      - consumer-data:/data
+    depends_on:
+      - redis
+
+  publisher:
+    build:
+      context: .
+      target: publisher
+    environment:
+      - JOBPOLLS_REDIS=redis:6379
+      - JOBPOLLS_DB=/source/.internships.sqlite
+    volumes:
+      - ${JOBPOLLS_DB_DIR:-/home/hung/ats-scrapers/engineering-ats}:/source:ro
+    depends_on:
+      - redis
+
+volumes:
+  consumer-data:

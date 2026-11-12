@@ -114,7 +114,8 @@ BATCH_SIZE = {"successfactors": 100, "lever": 250, "careers": 200, "canada": 210
 # Careers: 3 at once; 8 (each rendering pages in Chrome) pushed load past 100 on 16 cores
 # and starved the other sources (ADP / Paycom passes hit the 45-min cap, 2026-10-08).
 # Canada: all ~4 batches at once (API calls, little rendering) so a round takes ~3-4 min, not ~13.
-PARALLEL_BATCHES = {"careers": 3, "canada": 4,
+# Careers 3 -> 2 (2026-11-12): with 3 Chrome batches big_ats hit its 7 GB limit and was OOM-killed 18x in 4 h.
+PARALLEL_BATCHES = {"careers": 2, "canada": 4,
                     # Light API batches (~200 MB each): side by side so one slow batch (dead boards
                     # read through careers pages) doesn't hold up the rest of the list.
                     # Workday at 2 made each batch ~2x slower (more timeouts): no gain.
@@ -489,10 +490,24 @@ def baseline_done(db: sqlite3.Connection, source: str) -> bool:
 
 
 def mark_baseline_done(source: str) -> None:
-    db = connect()
-    with db:
-        db.execute("INSERT OR REPLACE INTO sources VALUES (?, 1)", (source,))
-    db.close()
+    # Four watchers and their children share this DB. A write can still fail with
+    # "database is locked" (a WAL read->write upgrade isn't covered by the busy timeout),
+    # and an uncaught one used to kill the whole big_ats watcher (81 restarts by 2026-11-12),
+    # which threw away every source's half-done pass. Retry with backoff instead.
+    for attempt in range(6):
+        db = None
+        try:
+            db = connect()  # connect() writes too (CREATE TABLE IF NOT EXISTS), so it's inside the retry
+            with db:
+                db.execute("INSERT OR REPLACE INTO sources VALUES (?, 1)", (source,))
+            return
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc) or attempt == 5:
+                raise
+            time.sleep(2 ** attempt)
+        finally:
+            if db is not None:
+                db.close()
 
 
 def save_company(db: sqlite3.Connection, source: str, company_key: str,
@@ -687,13 +702,45 @@ def write_csv() -> int:
     committed can still finish (and overwrite the files) after a call that saw that posting,
     silently dropping it until the next pass. An flock here serializes every read+write so each
     call's view of the DB is always at least as fresh as the one before it."""
+    return write_csv_if_stale(None)
+
+
+def write_csv_if_stale(since: float | None) -> int:
+    """write_csv, but skip it when another watcher already started a write (under the lock,
+    so after reading a DB that already had our rows) at or after `since` (wall-clock time of
+    our data). Six watchers each rewriting every 30 s queued up to 13 min on the lock
+    (2026-11-12) and the duplicate writes added memory pressure. Returns -1 when skipped."""
+    stamp = OUT_DIR / ".status" / "write_csv.last_start"
+    asked = time.monotonic()
     with open(_csv_lock_path(), "w") as lock_fh:
         fcntl.flock(lock_fh, fcntl.LOCK_EX)
+        got = time.monotonic()
         try:
+            if since is not None:
+                try:
+                    if float(stamp.read_text()) >= since:
+                        _timing_log("write_csv", f"waited {got - asked:.1f}s for lock, skipped (already fresh)")
+                        return -1
+                except (OSError, ValueError):
+                    pass
+            stamp.parent.mkdir(parents=True, exist_ok=True)
+            stamp.write_text(f"{time.time():.3f}")
             n = _write_csv_locked()
         finally:
             fcntl.flock(lock_fh, fcntl.LOCK_UN)
+    _timing_log("write_csv", f"waited {got - asked:.1f}s for lock, wrote in {time.monotonic() - got:.1f}s, {n} rows")
     return n
+
+
+def _timing_log(name: str, text: str) -> None:
+    """Per-step timings in engineering-ats/.status/<name>.timing (kept out of watch.log)."""
+    try:
+        path = OUT_DIR / ".status" / f"{name}.timing"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} pid={os.getpid()} {text}\n")
+    except OSError:
+        pass
 
 
 def _write_csv_locked() -> int:
@@ -4998,6 +5045,9 @@ async def _run_child_now(source: str, args, offset: int, limit: int | None) -> N
                     killed, hung = over_mem, not over_mem
                     await proc.wait()
     label = f"{source} [{offset + 1}-{offset + limit}]" if limit else source
+    # Spawn-to-exit wall time; compare with the "N min" the child logs (which starts
+    # after imports and setup) to see process startup / DB-lock overhead.
+    _timing_log(source, f"{label} child wall {time.monotonic() - started:.1f}s exit={proc.returncode}")
     if hung:
         log_line(f"{label:16} STOPPED: still running after {PASS_WALL_MAX // MIN} min (saved so far; next pass will run)")
     elif killed:
@@ -5009,6 +5059,35 @@ async def _run_child_now(source: str, args, offset: int, limit: int | None) -> N
 
 _csv_running = False
 _csv_again = False
+
+
+CSV_WRITE_EVERY = 30  # seconds: the CSVs are at most this far behind the DB
+_csv_pending = False
+_csv_requested_at: float | None = None  # wall-clock time of the oldest unwritten request
+
+
+def _request_csv_write() -> None:
+    """Mark the CSVs stale; _csv_writer_loop rewrites them within CSV_WRITE_EVERY seconds."""
+    global _csv_pending, _csv_requested_at
+    if not _csv_pending:
+        _csv_requested_at = time.time()
+    _csv_pending = True
+
+
+async def _csv_writer_loop() -> None:
+    global _csv_pending
+    while True:
+        await asyncio.sleep(CSV_WRITE_EVERY)
+        if not _csv_pending:
+            continue
+        _csv_pending = False
+        since = _csv_requested_at
+        try:
+            # Skips if any watcher already rewrote the CSVs after our data landed.
+            await asyncio.to_thread(write_csv_if_stale, since)
+        except Exception as exc:  # keep writing on later rounds; the DB is the source of truth
+            _request_csv_write()
+            log_line(f"write_csv failed ({type(exc).__name__}: {exc}); retrying in {CSV_WRITE_EVERY}s")
 
 
 async def _write_csv_async() -> None:
@@ -5034,22 +5113,33 @@ async def _supervise(source: str, interval: float, args, stop_after_one: bool) -
     interval = max(interval, MIN_GAP.get(source, 0))  # slow sources: exactly MIN_GAP apart
     while True:
         started = time.monotonic()
-        if single:
-            await _run_child(source, args, 0, None)
-        else:
-            # Big lists are split into batches, each in its own short-lived process,
-            # so memory per process stays small no matter how many companies an ATS has.
-            total = len(company_list(source, args.max_tenants))
-            batch = min(args.batch, BATCH_SIZE.get(source, args.batch))
-            side_by_side = asyncio.Semaphore(PARALLEL_BATCHES.get(source, 1))
+        batches = 1
+        try:
+            if single:
+                await _run_child(source, args, 0, None)
+            else:
+                # Big lists are split into batches, each in its own short-lived process,
+                # so memory per process stays small no matter how many companies an ATS has.
+                total = len(company_list(source, args.max_tenants))
+                batch = min(args.batch, BATCH_SIZE.get(source, args.batch))
+                side_by_side = asyncio.Semaphore(PARALLEL_BATCHES.get(source, 1))
+                batches = max(1, -(-total // batch))
 
-            async def run_batch(offset: int) -> None:
-                async with side_by_side:
-                    await _run_child(source, args, offset, batch)
-                await _write_csv_async()
-            await asyncio.gather(*(run_batch(o) for o in range(0, total, batch)))
-        mark_baseline_done(source)
-        await _write_csv_async()
+                async def run_batch(offset: int) -> None:
+                    async with side_by_side:
+                        await _run_child(source, args, offset, batch)
+                    # Don't wait for the CSV here: every batch used to queue behind a full
+                    # write_csv (shared flock across all 4 watchers), which made a 1-min batch
+                    # start ~13 min after the previous one. The writer task picks it up.
+                    _request_csv_write()
+                await asyncio.gather(*(run_batch(o) for o in range(0, total, batch)))
+            await asyncio.to_thread(mark_baseline_done, source)
+        except Exception as exc:  # one source's failure must not stop the others
+            log_line(f"{source:16} pass error ({type(exc).__name__}: {exc}); next pass will run")
+        else:
+            log_line(f"{source:16} full pass: {batches} batch{'es' if batches != 1 else ''} "
+                     f"in {(time.monotonic() - started) / 60:.1f} min")
+        _request_csv_write()
         if stop_after_one:
             return
         # Next pass `interval` after this one started; right away if the pass ran longer.
@@ -5091,7 +5181,11 @@ def run_group(group: str, sources: list[str], interval_minutes: float, descripti
              + (f"; skipped (no company list): {', '.join(skipped)}" if skipped else ""))
 
     async def main() -> None:
-        await asyncio.gather(*(_supervise(s, args.interval * MIN, args, args.once) for s in available))
+        writer = asyncio.create_task(_csv_writer_loop())
+        try:
+            await asyncio.gather(*(_supervise(s, args.interval * MIN, args, args.once) for s in available))
+        finally:
+            writer.cancel()
 
     try:
         asyncio.run(main())

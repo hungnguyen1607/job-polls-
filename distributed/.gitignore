@@ -1,0 +1,7 @@
+bin/
+obj/
+native/build/
+*.db
+*.db-wal
+*.db-shm
+.publisher-state.json

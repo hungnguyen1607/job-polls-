@@ -289,126 +289,300 @@ def _rank_outreach_row(row: dict, *, california_boost: bool, applied: set[str],
     return row
 
 
-def _canada_outreach() -> dict:
-    """Canada winter co-op list from winter_2027_companies.csv plus xlsx-only rows."""
-    slugs = _linkedin_by_company()
-    notes = _outreach_notes()
-    rows = []
-    seen: set[str] = set()
-    if WINTER.exists():
+CA_LOC = re.compile(
+    r"canada|ontario|qu[eé]bec|british columbia|alberta|manitoba|saskatchewan|nova scotia|"
+    r"new brunswick|newfoundland|prince edward|toronto|montr[eé]al|vancouver|ottawa|waterloo|"
+    r"kitchener|calgary|edmonton|winnipeg|halifax|hamilton|mississauga|markham|victoria|"
+    r"london, on|kingston, on|guelph|oakville|burlington, on|laval|longueuil|gatineau|sherbrooke",
+    re.I,
+)
+INTERN_RE = re.compile(r"intern|co-?op|coop|stagiaire|stage|student", re.I)
+
+
+def _winter_rows() -> dict[str, dict]:
+    out: dict[str, dict] = {}
+    if not WINTER.exists():
+        return out
+    try:
         with WINTER.open(newline="", encoding="utf-8") as fh:
             for r in csv.DictReader(fh):
-                company = _canon_company((r.get("company") or "").strip())
-                try:
-                    import internship_core as core
-                    company = core.outreach_company_name(company)
-                except Exception:  # noqa: BLE001
-                    pass
-                if not company:
-                    continue
-                key = company.casefold()
-                term = r.get("terms_matched") or ""
-                if key in seen:
-                    # Keep the row that actually names a term (not "unspecified").
-                    if term and term != "unspecified":
-                        for existing in rows:
-                            if existing["company"].casefold() == key and (
-                                    not existing["term"] or existing["term"] == "unspecified"):
-                                existing.update(term=term, term_count=r.get("term_count") or existing["term_count"],
-                                                example_job=r.get("example_job") or existing["example_job"],
-                                                example_link=r.get("example_link") or existing["example_link"],
-                                                winter_2027=r.get("winter_2027") or existing["winter_2027"])
-                    continue
-                seen.add(key)
-                status, date_messaged, extra = notes.get(key, notes.get(r.get("company", "").casefold(),
-                                                                        ("Not contacted", "", "")))
-                rec = {
-                    "company": company,
-                    "term": term,
-                    "term_count": r.get("term_count") or "",
-                    "intern_count": r.get("intern_count") or "",
-                    "california_count": r.get("california_count") or "",
-                    "example_job": r.get("example_job") or "",
-                    "example_link": r.get("example_link") or "",
-                    "careers_page": r.get("careers_page") or "",
-                    "ats": r.get("ats") or "",
-                    "linkedin": r.get("linkedin") or "",
-                    "open_now": r.get("open_now") or "",
-                    "status": status, "date_messaged": date_messaged, "notes": extra,
-                    "winter_2027": r.get("winter_2027") or "",
-                }
-                try:
-                    import internship_core as core
-                    if core.dedup_key(company) in _KNOWN_CA_STARTUPS:
-                        rec["startup"] = "yes"
-                except Exception:  # noqa: BLE001
-                    pass
-                rows.append(rec)
-                _with_linkedin(rows[-1], slugs)
-    if OUTREACH.exists():
-        try:
-            from openpyxl import load_workbook
+                k = _company_key(r.get("company") or "")
+                if k:
+                    out[k] = r
+    except OSError:
+        pass
+    return out
 
-            ws = load_workbook(OUTREACH, read_only=True).active
-            for r in ws.iter_rows(min_row=2, values_only=True):
-                if not r or not r[0]:
-                    continue
-                row = dict(zip(OUTREACH_COLS, (str(v) if v is not None else "" for v in r)))
-                company = _canon_company(row["company"])
-                key = company.casefold()
-                if key in seen:
-                    continue
-                seen.add(key)
-                row["company"] = company
-                row["linkedin"] = row.get("linkedin") or ""
-                rows.append(_with_linkedin(row, slugs))
-        except Exception:  # noqa: BLE001 — notes file can be mid-write; CSV rows already loaded
-            pass
+
+def _startup_ca_rows() -> dict[str, dict]:
+    """Every startup-page company with a Canadian office (startup_sources)."""
+    rows: dict[str, dict] = {}
+    try:
+        import internship_core as core
+        db = core.connect()
+        db.execute("CREATE TABLE IF NOT EXISTS startup_sources (name_key TEXT PRIMARY KEY, name TEXT, "
+                   "via TEXT, website TEXT, linkedin TEXT, team_size TEXT, stage TEXT, location TEXT, "
+                   "note TEXT, first_seen TEXT, last_seen TEXT)")
+        for name, via, site, li, stage, loc, note in db.execute(
+                "SELECT name, via, website, linkedin, stage, location, note FROM startup_sources"):
+            if not CA_LOC.search(loc or ""):
+                continue
+            k = _company_key(name or "")
+            if not k or k in rows:
+                continue
+            rows[k] = {"company": (name or "").strip(), "location": loc or "", "via": via or "",
+                       "careers_page": site or "", "linkedin": li or "", "stage": stage or "",
+                       "note": note or "", "term": "", "term_count": 0, "intern_count": 0,
+                       "open_now": "", "example_job": "", "example_link": "", "ats": "",
+                       "where": "Canada"}
+        db.close()
+    except Exception:  # noqa: BLE001
+        pass
+    return rows
+
+
+def _db_intern_evidence() -> dict[str, dict]:
+    """Companies with a Canadian intern/co-op posting in the DB (current or past)."""
+    rows: dict[str, dict] = {}
+    try:
+        import internship_core as core
+        db = core.connect()
+
+        def add(company: str, title: str, url: str, loc: str, term: str, open_: bool = False) -> None:
+            k = _company_key(company or "")
+            if not k:
+                return
+            r = rows.setdefault(k, {"company": (company or "").strip(), "terms": set(),
+                                    "intern_count": 0, "open_now": "", "example_job": "",
+                                    "example_link": "", "location": loc or "", "careers_page": "",
+                                    "ats": "", "linkedin": ""})
+            for t in (term or "").split(","):
+                t = t.strip()
+                if t and t.lower() != "unspecified":
+                    r["terms"].add(t)
+            r["intern_count"] += 1
+            if open_:
+                r["open_now"] = "yes"
+            if title and not r["example_job"]:
+                r["example_job"] = f"{title} ({loc})" if loc else title
+            if url and not r["example_link"]:
+                r["example_link"] = url
+            if loc and not r["location"]:
+                r["location"] = loc
+
+        for company, title, loc, url, open_ in db.execute(
+                "SELECT company, title, location, url, open FROM postings"):
+            if CA_LOC.search(loc or "") and INTERN_RE.search(title or ""):
+                terms = core.posting_terms(title or "", url or "")
+                add(company, title, url, loc, ", ".join(terms), bool(open_))
+        for company, title, loc, url, term in db.execute(
+                "SELECT company, title, location, url, term FROM ca_intern_history"):
+            if CA_LOC.search(loc or "") and INTERN_RE.search(title or ""):
+                add(company, title, url, loc, term)
+        for company, title, loc, url, term in db.execute(
+                "SELECT company, title, location, url, term FROM swe_intern_history WHERE region='Canada'"):
+            if CA_LOC.search(loc or "") and INTERN_RE.search(title or ""):
+                add(company, title, url, loc, term)
+        db.close()
+    except Exception:  # noqa: BLE001
+        pass
+    for r in rows.values():
+        terms = sorted(r.pop("terms"))
+        r["term"] = ", ".join(terms)
+        r["term_count"] = len(terms)
+    return rows
+
+
+def _intern_sort_key(r: dict) -> tuple:
+    return (
+        0 if "Winter 2027" in (r.get("term") or "") else 1,
+        -int(r.get("term_count") or 0),
+        -int(r.get("intern_count") or 0),
+        (r.get("company") or "").lower(),
+    )
+
+
+def _canada_outreach() -> dict:
+    """Every Canadian startup-page company + every DB company with Canadian intern evidence."""
+    rows = _startup_ca_rows()
+    evidence = _db_intern_evidence()
+    winter = _winter_rows()
+    for k, ev in evidence.items():
+        row = rows.setdefault(k, {"company": ev["company"], "where": "Canada", "via": "",
+                                  "careers_page": "", "linkedin": "", "location": ev.get("location", ""),
+                                  "term": "", "term_count": 0, "intern_count": 0, "open_now": "",
+                                  "example_job": "", "example_link": "", "ats": ""})
+        row.update(term=ev["term"], term_count=ev["term_count"], intern_count=ev["intern_count"],
+                   open_now=ev["open_now"], example_job=ev["example_job"],
+                   example_link=ev["example_link"],
+                   location=ev.get("location") or row.get("location", ""))
+    for k, w in winter.items():
+        row = rows.setdefault(k, {"company": (w.get("company") or "").strip(), "where": "Canada",
+                                  "via": "", "careers_page": "", "linkedin": "", "location": "",
+                                  "term": "", "term_count": 0, "intern_count": 0, "open_now": "",
+                                  "example_job": "", "example_link": "", "ats": ""})
+        terms = (w.get("terms_matched") or "").strip()
+        row.update(term=terms or row.get("term", ""),
+                   term_count=int(w.get("term_count") or row.get("term_count") or 0),
+                   intern_count=int(w.get("intern_count") or row.get("intern_count") or 0),
+                   open_now=(w.get("open_now") or row.get("open_now") or ""),
+                   example_job=(w.get("example_job") or row.get("example_job") or ""),
+                   example_link=(w.get("example_link") or row.get("example_link") or ""),
+                   careers_page=(w.get("careers_page") or row.get("careers_page") or ""),
+                   ats=(w.get("ats") or row.get("ats") or ""),
+                   linkedin=(w.get("linkedin") or row.get("linkedin") or ""))
+        if (w.get("winter_2027") or "") == "yes" and "Winter 2027" not in row.get("term", ""):
+            row["term"] = "Winter 2027" + (", " + row["term"] if row.get("term") else "")
+            row["term_count"] = int(row.get("term_count") or 0) + 1
+    applied = _applied_keys()
+    notes = _outreach_notes()
+    slugs = _linkedin_by_company()
+    for r in rows.values():
+        _with_linkedin(r, slugs)
+        company = r.get("company") or ""
+        r["applied"] = "yes" if _is_applied(company, applied) else ""
+        status, date_messaged, extra = notes.get(_canon_company(company).casefold(),
+                                                 ("Not contacted", "", ""))
+        r["status"], r["date_messaged"], r["notes"] = status, date_messaged, extra
+        r.pop("note", None)
+        r.pop("stage", None)
+        r["where"] = "Canada"
+    out = list(rows.values())
+    out.sort(key=_intern_sort_key)
     updated = datetime_utc_iso(WINTER.stat().st_mtime) if WINTER.exists() else None
-    return {"rows": rows, "updated": updated}
+    return {"rows": out, "updated": updated}
 
 
 def _us_outreach() -> dict:
-    """US software-intern employers (J-1 High/Med overlay on a few names)."""
+    """All US intern employers: Canadian-intern history flag + sponsor/no-sponsor flag."""
+    rows: list[dict] = []
+    if not US_SPONSOR.exists():
+        return {"rows": [], "updated": None}
+    try:
+        import internship_core as core
+        db = core.connect()
+        ca_keys = {core.dedup_key(core.outreach_company_name(c or ""))
+                   for (c,) in db.execute("SELECT DISTINCT company FROM ca_intern_history")}
+        ca_keys |= {core.dedup_key(core.outreach_company_name(c or ""))
+                    for (c,) in db.execute(
+                        "SELECT DISTINCT company FROM swe_intern_history WHERE region='Canada'")}
+        db.close()
+    except Exception:  # noqa: BLE001
+        ca_keys = set()
+    applied = _applied_keys()
+    notes = _outreach_notes()
     slugs = _linkedin_by_company()
-    rows = []
-    if US_SPONSOR.exists():
-        with US_SPONSOR.open(newline="", encoding="utf-8") as fh:
-            for r in csv.DictReader(fh):
-                company = (r.get("company") or "").strip()
-                if not company:
-                    continue
-                rec = {
-                    "company": company,
-                    "confidence": r.get("confidence") or "",
-                    "visa_note": r.get("visa_note") or "",
-                    "open_now": r.get("open_now") or "",
-                    "blocked": r.get("blocked") or "",
-                    "term": r.get("terms_matched") or "",
-                    "term_count": r.get("term_count") or "",
-                    "intern_count": r.get("intern_count") or "",
-                    "california_count": r.get("california_count") or "",
-                    "example_job": r.get("example_job") or "",
-                    "example_link": r.get("example_link") or "",
-                    "careers_page": r.get("careers_page") or "",
-                    "linkedin": r.get("linkedin") or "",
-                    "contact": r.get("contact") or "",
-                    "work_auth": r.get("work_auth") or "",
-                    "company_size": r.get("company_size") or "",
-                    "funding_stage": r.get("funding_stage") or "",
-                    "smb": r.get("smb") or "",
-                    "ca_interns": r.get("ca_interns") or "",
-                    "ca_intern_profiles": r.get("ca_intern_profiles") or "",
-                }
-                try:
-                    import internship_core as core
-                    if core.dedup_key(company) in _KNOWN_US_STARTUPS:
-                        rec["startup"] = "yes"
-                except Exception:  # noqa: BLE001
-                    pass
-                rows.append(_with_linkedin(rec, slugs))
-    updated = datetime_utc_iso(US_SPONSOR.stat().st_mtime) if US_SPONSOR.exists() else None
-    return {"rows": rows, "updated": updated}
+    with US_SPONSOR.open(newline="", encoding="utf-8") as fh:
+        for r in csv.DictReader(fh):
+            company = (r.get("company") or "").strip()
+            if not company:
+                continue
+            row = {
+                "company": company,
+                "where": "US",
+                "term": r.get("terms_matched") or "",
+                "term_count": int(r.get("term_count") or 0),
+                "intern_count": int(r.get("intern_count") or 0),
+                "open_now": r.get("open_now") or "",
+                "example_job": r.get("example_job") or "",
+                "example_link": r.get("example_link") or "",
+                "careers_page": r.get("careers_page") or "",
+                "ats": "",
+                "linkedin": r.get("linkedin") or "",
+                "contact": r.get("contact") or "",
+                "work_auth": r.get("work_auth") or "",
+                "blocked": r.get("blocked") or "",
+                "visa": "no-sponsor" if (r.get("blocked") or r.get("work_auth") == "no_sponsor")
+                        else "sponsor",
+                "ca_intern_flag": "yes" if _company_key(company) in ca_keys else "",
+                "applied": "yes" if _is_applied(company, applied) else "",
+            }
+            status, date_messaged, extra = notes.get(_canon_company(company).casefold(),
+                                                     ("Not contacted", "", ""))
+            row["status"], row["date_messaged"], row["notes"] = status, date_messaged, extra
+            _with_linkedin(row, slugs)
+            rows.append(row)
+    rows.sort(key=_intern_sort_key)
+    return {"rows": rows, "updated": datetime_utc_iso(US_SPONSOR.stat().st_mtime)}
+
+
+def _big5_rows(canada: dict, us: dict) -> dict:
+    """Companies scouted through WaterlooWorks/PEY + UW class profiles + UBC/Mac/McGill signals."""
+    companies: dict[str, str] = {}
+    try:
+        import internship_core as core
+        db = core.connect()
+        for (name,) in db.execute(
+                "SELECT name FROM discovered WHERE source IN ('waterloo','waterlooworks','pey')"):
+            k = core.dedup_key(core.outreach_company_name(name or ""))
+            if k:
+                companies.setdefault(k, (name or "").strip())
+        db.close()
+    except Exception:  # noqa: BLE001
+        pass
+    ww = ROOT / "engineering-ats" / "ww_pipeline_toronto_montreal.csv"
+    if ww.exists():
+        try:
+            with ww.open(newline="", encoding="utf-8") as fh:
+                for r in csv.DictReader(fh):
+                    name = (r.get("company") or "").strip()
+                    k = _company_key(name)
+                    if k:
+                        companies.setdefault(k, name)
+        except OSError:
+            pass
+    cp = ROOT / "engineering-ats" / "class_profile_employers.json"
+    if cp.exists():
+        try:
+            data = json.loads(cp.read_text(encoding="utf-8"))
+            for name in (data.get("employers") or {}).keys():
+                k = _company_key(name)
+                if k:
+                    companies.setdefault(k, name)
+        except (OSError, ValueError):
+            pass
+    lookup: dict[str, dict] = {}
+    for part in (canada, us):
+        for r in part.get("rows", []):
+            lookup[_company_key(r.get("company") or "")] = r
+    known = set(lookup)
+    try:
+        import internship_core as core
+        db = core.connect()
+        known |= {_company_key(name or "") for (name,) in db.execute("SELECT name FROM startup_sources")}
+        db.close()
+    except Exception:  # noqa: BLE001
+        pass
+    sig = ROOT / "engineering-ats" / "school_signals.json"
+    if sig.exists():
+        try:
+            data = json.loads(sig.read_text(encoding="utf-8"))
+            for k, rec in data.items():
+                name = (rec.get("company") or "").strip()
+                if name and k in known:
+                    companies.setdefault(k, name)
+        except (OSError, ValueError):
+            pass
+    applied = _applied_keys()
+    notes = _outreach_notes()
+    rows: list[dict] = []
+    for k, name in companies.items():
+        src = lookup.get(k) or {}
+        status, date_messaged, extra = notes.get(
+            _canon_company(name).casefold(), ("Not contacted", "", ""))
+        rows.append({
+            "company": name, "where": "",
+            "term": src.get("term") or "", "term_count": src.get("term_count") or 0,
+            "intern_count": src.get("intern_count") or 0, "open_now": src.get("open_now") or "",
+            "example_job": src.get("example_job") or "",
+            "example_link": src.get("example_link") or "",
+            "careers_page": src.get("careers_page") or "",
+            "linkedin": src.get("linkedin") or "",
+            "applied": "yes" if _is_applied(name, applied) else "",
+            "status": status, "date_messaged": date_messaged, "notes": extra,
+        })
+    rows.sort(key=lambda r: (r.get("company") or "").lower())
+    return {"rows": rows, "updated": None}
 
 
 def _contact_only_row(rec: dict) -> dict:
@@ -573,35 +747,22 @@ def outreach_payload() -> dict:
     now = time.time()
     if _payload_cache and now - _payload_cache[0] < 45:
         return _payload_cache[1]
-    applied = _applied_keys()
-    store = outreach_contacts.load()
     canada = _canada_outreach()
+    if not canada["rows"]:  # a busy/locked DB can make the first read empty; retry once
+        canada = _canada_outreach()
     us = _us_outreach()
-    canada["rows"] = [_rank_outreach_row(r, california_boost=False, applied=applied, store=store)
-                      for r in canada["rows"]]
-    us["rows"] = [_rank_outreach_row(r, california_boost=True, applied=applied, store=store)
-                  for r in us["rows"]]
-    _inject_contact_rows(canada, us, applied, store=store)
-    meta = _company_meta()
-    _apply_meta(canada["rows"], meta)
-    _apply_meta(us["rows"], meta)
+    big5 = _big5_rows(canada, us)
     last = _last_intern_dates()
     try:
         import internship_core as core
-        have = {core.dedup_key(core.outreach_company_name(r.get("company") or ""))
-                for r in canada["rows"] + us["rows"]}
-    except Exception:  # noqa: BLE001
-        have = set()
-    payload = {"canada": canada, "us": us, "startups": {"rows": _startup_rows(have)}}
-    try:
-        import internship_core as core
-        for part in payload.values():
+        for part in (canada, us, big5):
             for r in part["rows"]:
                 hit = last.get(core.dedup_key(core.outreach_company_name(r.get("company") or "")))
                 if hit:
                     r["last_intern_month"], r["last_intern_title"] = hit
     except Exception:  # noqa: BLE001
         pass
+    payload = {"canada": canada, "us": us, "big5": big5}
     _payload_cache = (now, payload)
     return payload
 
