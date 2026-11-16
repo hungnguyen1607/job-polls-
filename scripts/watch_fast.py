@@ -22,7 +22,7 @@ from internship_core import run_group  # noqa: E402
 
 SOURCES = [
     "simplify", "jobright", "zshah101", "earlycareerradar", "applyguy", "vanshb03",
-    "speedyapply", "negarprh", "hansonchen", "remoterocketship",
+    "speedyapply", "negarprh", "hansonchen", "remoterocketship", "interninsider",
 ]
 
 if __name__ == "__main__":

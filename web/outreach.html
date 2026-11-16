@@ -30,30 +30,29 @@
   td.v { font-size: 12px; white-space: nowrap; }
   td.v .ok { color: #047857; } td.v .no { color: #b91c1c; }
   .applied { color: var(--muted); font-size: 12px; font-weight: 400; margin-left: 8px; }
+  select { border: 1px solid #ddd; border-radius: 8px; padding: 8px 10px; font: inherit; background: #fff; }
+  td.c { color: var(--muted); font-size: 13px; }
+  td.c b { color: #111; font-weight: 500; }
 </style>
 </head>
 <body>
 <main>
   <h1>Companies</h1>
   <div id="sub">Loading…</div>
-  <nav><a href="/">← Internships</a><a href="/tailor">Tailor resume</a><a href="/tracker">Application tracker</a></nav>
+  <nav><a href="/">← Internships</a><a href="/tailor">Tailor resume</a><a href="/tracker">Application tracker</a><a href="/events">Events</a></nav>
   <div class="bar">
     <button class="tab on" data-region="canada">Canada</button>
     <button class="tab" data-region="us">US</button>
     <button class="tab" data-region="big5">Big 5</button>
     <input id="q" type="search" placeholder="Search companies…" autofocus>
+    <select id="city" title="Companies with an office (any posting) in this city"><option value="">All cities</option></select>
   </div>
   <table>
     <thead>
       <tr>
         <th data-k="company">Company</th>
-        <th data-k="where">Where</th>
-        <th data-k="last_term">Last intern</th>
-        <th data-k="intern_count">Interns</th>
-        <th data-k="open_now">Open</th>
-        <th data-k="visa">Visa</th>
-        <th data-k="ca_intern_flag">CA interns</th>
-        <th>People</th>
+        <th data-k="cities">Locations</th>
+        <th data-k="last_term">Last intern hired</th>
       </tr>
     </thead>
     <tbody id="rows"></tbody>
@@ -87,7 +86,7 @@
   }
 
   const REFRESH_MS = 10_000;
-  let canada = [], us = [], big5 = [];
+  let canada = [], us = [], big5 = [], metros = [];
   let region = "canada", sortKey = "last_term", sortDir = 1;
 
   function rowsFor() {
@@ -97,7 +96,9 @@
   }
 
   const TERM_ORDER = ["Winter 2027", "Spring 2027", "Summer 2027", "Fall 2027", "Fall 2026", "Summer 2026",
-                      "Spring 2026", "Winter 2026", "Fall 2025", "Summer 2025", "Winter 2025"];
+                      "Spring 2026", "Winter 2026", "Fall 2025", "Summer 2025", "Spring 2025", "Winter 2025",
+                      "Fall 2024", "Summer 2024", "Spring 2024", "Winter 2024", "Fall 2023", "Summer 2023",
+                      "Spring 2023", "Winter 2023", "Fall 2022", "Summer 2022", "Winter 2022"];
   function lastTerm(r) {
     const terms = String(r.term || "").split(/\s*,\s*/).filter(Boolean);
     const known = terms.filter((t) => TERM_ORDER.includes(t)).sort((a, b) => TERM_ORDER.indexOf(a) - TERM_ORDER.indexOf(b));
@@ -122,13 +123,16 @@
     if (k === "open_now") return r.open_now === "yes" ? 0 : 1;
     if (k === "visa") return r.visa === "sponsor" ? 0 : 1;
     if (k === "ca_intern_flag") return r.ca_intern_flag === "yes" ? 0 : 1;
+    if (k === "cities") return (r.cities && r.cities[0]) || "\uffff";
     return String(r[k] || "");
   }
 
   function render() {
     const q = $("#q").value.trim().toLowerCase();
     const all = rowsFor();
+    const city = $("#city").value;
     let shown = all.filter((r) => {
+      if (city && !(r.cities || []).includes(city)) return false;
       if (!q) return true;
       const blob = `${r.company || ""} ${r.example_job || ""} ${r.term || ""} ${r.where || ""}`.toLowerCase();
       return blob.includes(q);
@@ -141,7 +145,10 @@
     $("#rows").innerHTML = shown.map((r) => {
       const p = peopleLinks(r);
       const applied = r.applied === "yes" ? `<span class="applied">applied</span>` : "";
-      const job = r.example_link
+      const idb = r.interndb_url
+        ? `<a href="${esc(r.interndb_url)}" target="_blank" rel="noopener" title="${r.interndb_reviews || 0} intern reviews">InternDB${r.interndb_reviews ? ` (${r.interndb_reviews})` : ""}</a>`
+        : "";
+      const job = r.example_link && r.example_link !== r.interndb_url
         ? `<a class="rec" href="${esc(r.example_link)}" target="_blank" rel="noopener">Job</a>`
         : r.careers_page ? `<a class="rec" href="${esc(r.careers_page)}" target="_blank" rel="noopener">Site</a>` : "";
       const visa = region === "us"
@@ -150,24 +157,37 @@
       const ca = region === "us" && r.ca_intern_flag === "yes" ? `<span class="ok">yes</span>` : "";
       return `<tr>
         <td><a href="${esc(p.rec)}" target="_blank" rel="noopener">${esc(r.company)}</a>${applied}</td>
-        <td class="m">${esc(r.where || "")}</td>
-        <td class="n" title="${esc(r.last_intern_title || "")}">${esc(lastTerm(r))}${r.open_now === "yes" && lastTerm(r) !== "open now" ? " · open" : ""}</td>
-        <td class="n">${r.intern_count || ""}</td>
-        <td class="n">${r.open_now === "yes" ? "open" : ""}</td>
-        <td class="v">${visa}</td>
-        <td class="v">${ca}</td>
-        <td class="people">
-          <a class="rec" href="${esc(p.rec)}" target="_blank" rel="noopener">Recruiters</a>
-          <a href="${esc(p.eng)}" target="_blank" rel="noopener">Engineers</a>
-          ${job}
-        </td>
+        <td class="c">${citiesCell(r, city)}</td>
+        <td class="n" title="${esc(r.last_intern_title || "")}">${esc(lastTerm(r))}</td>
       </tr>`;
-    }).join("") || `<tr><td class="m" colspan="8">No companies</td></tr>`;
+    }).join("") || `<tr><td class="m" colspan="3">No companies</td></tr>`;
     const n = all.length;
     const label = region === "us" ? "US intern employers"
       : region === "big5" ? "companies hiring through the Big 5"
       : "companies with a Canadian office";
-    $("#sub").textContent = q ? `${shown.length} of ${n} ${label}` : `${n} ${label}.`;
+    const filtered = q || city;
+    $("#sub").textContent = filtered ? `${shown.length} of ${n} ${label}${city ? ` in ${city}` : ""}` : `${n} ${label}.`;
+  }
+
+  function citiesCell(r, city) {
+    const list = r.cities || [];
+    if (!list.length) return esc(String(r.location || "").replace(/\s*\(Clera [^)]*\)/i, ""));
+    const ordered = city ? [city, ...list.filter((c) => c !== city)] : list;
+    return ordered.map((c) => c === city ? `<b>${esc(c)}</b>` : esc(c)).join(", ");
+  }
+
+  function fillCities() {
+    const sel = $("#city"), keep = sel.value, all = rowsFor();
+    const count = {};
+    for (const r of all) for (const c of r.cities || []) count[c] = (count[c] || 0) + 1;
+    const group = (cc, label) => {
+      const opts = metros.filter((m) => m.country === cc && count[m.name])
+        .sort((a, b) => count[b.name] - count[a.name])
+        .map((m) => `<option value="${esc(m.name)}">${esc(m.name)} (${count[m.name]})</option>`).join("");
+      return opts ? `<optgroup label="${label}">${opts}</optgroup>` : "";
+    };
+    sel.innerHTML = `<option value="">All cities</option>${group("CA", "Canada")}${group("US", "United States")}`;
+    sel.value = [...sel.options].some((o) => o.value === keep) ? keep : "";
   }
 
   async function load() {
@@ -178,6 +198,8 @@
       if (data.canada?.rows?.length) canada = data.canada.rows;
       if (data.us?.rows?.length) us = data.us.rows;
       if (data.big5?.rows?.length) big5 = data.big5.rows;
+      if (data.metros?.length) metros = data.metros;
+      fillCities();
       render();
     } catch (e) {
       // Keep the last good lists; a rebuild can take ~10 s and reset the request.
@@ -190,14 +212,16 @@
   document.querySelectorAll("[data-region]").forEach((b) => b.addEventListener("click", () => {
     document.querySelectorAll("[data-region]").forEach((t) => t.classList.toggle("on", t === b));
     region = b.dataset.region;
+    fillCities();
     render();
     $("#q").focus();
   }));
   $("#q").addEventListener("input", render);
+  $("#city").addEventListener("change", render);
   document.querySelector("table").addEventListener("click", (e) => {
     const k = e.target.dataset.k;
     if (!k) return;
-    sortDir = k === sortKey ? -sortDir : (["company", "where", "last_term", "open_now", "visa", "ca_intern_flag"].includes(k) ? 1 : -1);
+    sortDir = k === sortKey ? -sortDir : (["company", "where", "cities", "last_term", "open_now", "visa", "ca_intern_flag"].includes(k) ? 1 : -1);
     sortKey = k;
     render();
   });

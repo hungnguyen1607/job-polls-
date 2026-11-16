@@ -34,6 +34,7 @@
   <a id="tailor" href="/tailor" hidden style="margin-bottom:16px; color:#111; font-size:13px;">Tailor resume →</a>
   <a id="tracker" href="/tracker" hidden style="margin:0 0 16px 16px; color:#111; font-size:13px;">Application tracker →</a>
   <a id="outreach" href="/outreach" hidden style="margin:0 0 16px 16px; color:#111; font-size:13px;">Outreach tracker →</a>
+  <a id="events" href="/events" hidden style="margin:0 0 16px 16px; color:#111; font-size:13px;">Events →</a>
   <div class="bar">
     <button class="tab on" data-region="us">US</button>
     <button class="tab" data-region="canada">Canada</button>
@@ -94,7 +95,7 @@
     render();
   }));
   $("#q").addEventListener("input", render);
-  if (["localhost", "127.0.0.1"].includes(location.hostname)) $("#tailor").hidden = $("#tracker").hidden = $("#outreach").hidden = false;
+  if (["localhost", "127.0.0.1"].includes(location.hostname)) $("#tailor").hidden = $("#tracker").hidden = $("#outreach").hidden = $("#events").hidden = false;
   load();
   setInterval(load, REFRESH_MS);
   setInterval(render, 30_000);

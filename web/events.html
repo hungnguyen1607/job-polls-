@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Events</title>
+<style>
+  :root { --muted: #6b7280; --line: #eee; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #fff; color: #111; font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 1100px; margin: 0 auto; padding: 32px 20px 64px; }
+  h1 { font-size: 20px; font-weight: 600; margin: 0 0 4px; }
+  #sub { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
+  nav { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
+  nav a { color: var(--muted); margin-right: 14px; }
+  .bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+  .tab { border: 1px solid #ddd; background: #fff; padding: 6px 14px; border-radius: 999px; cursor: pointer; font: inherit; }
+  .tab.on { background: #111; color: #fff; border-color: #111; }
+  input[type=search] { flex: 1; min-width: 200px; border: 1px solid #ddd; border-radius: 8px; padding: 8px 12px; font: inherit; outline: none; }
+  input[type=search]:focus { border-color: #111; }
+  label { color: var(--muted); font-size: 13px; display: flex; gap: 4px; align-items: center; cursor: pointer; }
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; font-size: 12px; font-weight: 500; color: var(--muted); padding: 6px 8px 6px 0; border-bottom: 1px solid #ddd; white-space: nowrap; }
+  td { padding: 10px 8px 10px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+  td a { color: #111; }
+  td.n { color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; font-size: 13px; }
+  td.m { color: var(--muted); font-size: 13px; }
+  .t { display: inline-block; font-size: 11px; font-weight: 500; color: #047857; border: 1px solid #a7f3d0; border-radius: 999px; padding: 0 6px; margin-left: 6px; }
+  .src { color: var(--muted); font-size: 12px; }
+  #counts { color: var(--muted); font-size: 12px; margin-top: 16px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Events</h1>
+  <div id="sub">Loading…</div>
+  <nav><a href="/">← Internships</a><a href="/outreach">Companies</a><a href="/tracker">Application tracker</a><a href="/tailor">Tailor resume</a></nav>
+  <div class="bar">
+    <button class="tab on" data-city="">All</button>
+    <button class="tab" data-city="Toronto">Toronto</button>
+    <button class="tab" data-city="Montreal">Montreal</button>
+    <button class="tab" data-city="Ottawa">Ottawa</button>
+    <input id="q" type="search" placeholder="Search events or companies…" autofocus>
+    <label><input type="checkbox" id="hosted" checked> Company-hosted only</label>
+    <label><input type="checkbox" id="targets"> My target companies</label>
+    <label><input type="checkbox" id="free"> Free only</label>
+  </div>
+  <table>
+    <thead><tr><th>Date</th><th>Event</th><th>Hosted by</th><th>City</th><th>Price</th></tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <div id="counts"></div>
+</main>
+<script>
+  const $ = (s) => document.querySelector(s);
+  const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  let events = [], city = "", meta = {};
+
+  const TZ = { Toronto: "America/Toronto", Montreal: "America/Toronto", Ottawa: "America/Toronto" };
+  function when(ev) {
+    const d = new Date(ev.start_sort || ev.start);
+    if (isNaN(d)) return esc(ev.start || "");
+    const day = d.toLocaleDateString("en-CA", { weekday: "short", month: "short", day: "numeric", timeZone: TZ[ev.city] });
+    const hasTime = /T\d\d:\d\d/.test(ev.start || "") && !/T00:00:00(\.0+)?Z?$/.test(ev.start || "");
+    const time = hasTime ? d.toLocaleTimeString("en-CA", { hour: "numeric", minute: "2-digit", timeZone: TZ[ev.city] }) : "";
+    return `${day}${time ? `<br>${time}` : ""}`;
+  }
+
+  function render() {
+    const q = $("#q").value.trim().toLowerCase();
+    const onlyHosted = $("#hosted").checked, onlyTargets = $("#targets").checked, onlyFree = $("#free").checked;
+    const shown = events.filter((e) => {
+      if (city && e.city !== city) return false;
+      if (onlyHosted && !(e.hosts || []).length) return false;
+      if (onlyTargets && !(e.targets || []).length) return false;
+      if (onlyFree && e.price !== "Free") return false;
+      if (!q) return true;
+      return `${e.title} ${(e.hosts || []).join(" ")} ${(e.organizers || []).join(" ")} ${e.venue || ""}`.toLowerCase().includes(q);
+    });
+    $("#rows").innerHTML = shown.map((e) => {
+      const tg = new Set(e.targets || []);
+      const hosts = e.hosts || [];
+      const tag = (o) => tg.has(o) ? `${esc(o)}<span class="t">target</span>` : esc(o);
+      const orgs = hosts.length
+        ? `<b>${hosts.map(tag).join(", ")}</b>` + ((e.organizers || []).filter((o) => !hosts.includes(o)).length ? `<div class="src">${esc((e.organizers || []).filter((o) => !hosts.includes(o)).join(", "))}</div>` : "")
+        : `<span class="src">${(e.organizers || []).map(tag).join(", ")}</span>`;
+      return `<tr>
+        <td class="n">${when(e)}</td>
+        <td><a href="${esc(e.url)}" target="_blank" rel="noopener">${esc(e.title)}</a><div class="src">${esc(e.venue || "")}${e.venue ? " · " : ""}${esc(e.source)}${(e.also_on || []).length ? `, ${esc(e.also_on.join(", "))}` : ""}</div></td>
+        <td>${orgs}</td>
+        <td class="m">${esc(e.city)}</td>
+        <td class="n">${esc(e.price || "")}</td>
+      </tr>`;
+    }).join("") || `<tr><td class="m" colspan="5">${meta.refreshing && !events.length ? "Collecting events… this first run takes a few minutes." : "No events"}</td></tr>`;
+    const nTargets = events.filter((e) => (e.targets || []).length).length;
+    const nHosted = events.filter((e) => (e.hosts || []).length).length;
+    $("#sub").textContent = `${shown.length} shown · ${nHosted} of ${events.length} upcoming events in Toronto, Montreal and Ottawa are hosted by a company · ${nTargets} by companies on your outreach list`
+      + (meta.updated ? ` · updated ${new Date(meta.updated).toLocaleString("en-CA")}` : "") + (meta.refreshing ? " · refreshing…" : "");
+    const c = meta.counts || {};
+    $("#counts").textContent = Object.keys(c).length ? "Sources: " + Object.entries(c).map(([k, v]) => `${k} ${v}`).join(" · ") : "";
+  }
+
+  async function load() {
+    try {
+      const res = await fetch("/api/events", { cache: "no-store" });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      meta = await res.json();
+      events = meta.events || [];
+      render();
+    } catch (e) {
+      if (!events.length) $("#sub").textContent = "Loading… (server busy, retrying)";
+    }
+  }
+
+  document.querySelectorAll("[data-city]").forEach((b) => b.addEventListener("click", () => {
+    document.querySelectorAll("[data-city]").forEach((t) => t.classList.toggle("on", t === b));
+    city = b.dataset.city;
+    render();
+  }));
+  ["#q", "#hosted", "#targets", "#free"].forEach((s) => $(s).addEventListener("input", render));
+
+  load();
+  setInterval(load, 60_000);
+</script>
+</body>
+</html>

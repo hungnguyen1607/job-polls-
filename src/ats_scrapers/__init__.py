@@ -15,7 +15,6 @@ directory and is not part of the installable package.
 """
 
 from ats_scrapers._version import __version__
-from ats_scrapers.client import Client, find_company, list_ats, search
 from ats_scrapers.exceptions import (
     ATSScrapersError,
     CompanyNotFoundError,
@@ -27,6 +26,19 @@ from ats_scrapers.fetch import Fetcher, FetchResponse, MalformedJSONError
 from ats_scrapers.manifest import Manifest
 from ats_scrapers.models import ATSType, Company, EmploymentType, Job, Salary, SalaryPeriod
 from ats_scrapers.resolve import ResolvedCareersUrl, get_scraper_for_url, resolve_careers_url
+
+# The dataset client pulls in pandas/numpy/pyarrow (~70 MB). The internship pollers never use it
+# and run 10-30 processes at once, so load it only when someone asks for it.
+_CLIENT_NAMES = {"Client", "find_company", "list_ats", "search"}
+
+
+def __getattr__(name: str):  # noqa: ANN202
+    if name in _CLIENT_NAMES:
+        from ats_scrapers import client
+
+        return getattr(client, name)
+    raise AttributeError(f"module 'ats_scrapers' has no attribute {name!r}")
+
 
 __all__ = [
     "ATSScrapersError",

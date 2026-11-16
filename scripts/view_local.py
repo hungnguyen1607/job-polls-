@@ -402,6 +402,44 @@ def _intern_sort_key(r: dict) -> tuple:
     )
 
 
+def _merge_interndb(rows: dict[str, dict]) -> None:
+    """Add every interndb.io company (except US-only reviewed ones) to the Canada rows.
+
+    Reviewed companies bring real intern evidence: terms from review start dates and the
+    office cities in r["interndb_locations"]. Companies interndb lists without any review have
+    no country, so new ones are marked where="unverified" instead of claiming a Canadian office.
+    """
+    try:
+        import interndb
+        data = interndb.load()
+    except Exception:  # noqa: BLE001
+        return
+    for name, rec in data.items():
+        if rec.get("us_reviews") and not rec.get("canada_reviews"):
+            continue
+        k = _company_key(name)
+        if not k:
+            continue
+        new = k not in rows
+        row = rows.setdefault(k, {"company": name, "where": "Canada", "via": "interndb",
+                                  "careers_page": "", "linkedin": "", "location": "",
+                                  "term": "", "term_count": 0, "intern_count": 0, "open_now": "",
+                                  "example_job": "", "example_link": "", "ats": ""})
+        row["interndb_url"] = rec.get("url") or ""
+        row["interndb_reviews"] = int(rec.get("reviews") or 0)
+        row["interndb_locations"] = list((rec.get("locations") or {}).keys())
+        terms = [t for t in rec.get("terms") or [] if t]
+        if terms:
+            have = [t for t in (row.get("term") or "").split(", ") if t]
+            merged = have + [t for t in terms if t not in have]
+            row["term"] = ", ".join(merged)
+            row["term_count"] = max(int(row.get("term_count") or 0), len(merged))
+        if not row.get("example_link"):
+            row["example_link"] = row["interndb_url"]
+        if new and not rec.get("canada_reviews"):
+            row["where_override"] = "unverified"
+
+
 def _canada_outreach() -> dict:
     """Every Canadian startup-page company + every DB company with Canadian intern evidence."""
     rows = _startup_ca_rows()
@@ -434,6 +472,7 @@ def _canada_outreach() -> dict:
         if (w.get("winter_2027") or "") == "yes" and "Winter 2027" not in row.get("term", ""):
             row["term"] = "Winter 2027" + (", " + row["term"] if row.get("term") else "")
             row["term_count"] = int(row.get("term_count") or 0) + 1
+    _merge_interndb(rows)
     applied = _applied_keys()
     notes = _outreach_notes()
     slugs = _linkedin_by_company()
@@ -446,7 +485,7 @@ def _canada_outreach() -> dict:
         r["status"], r["date_messaged"], r["notes"] = status, date_messaged, extra
         r.pop("note", None)
         r.pop("stage", None)
-        r["where"] = "Canada"
+        r["where"] = r.pop("where_override", None) or "Canada"
     out = list(rows.values())
     out.sort(key=_intern_sort_key)
     updated = datetime_utc_iso(WINTER.stat().st_mtime) if WINTER.exists() else None
@@ -742,6 +781,50 @@ def _startup_rows(skip: set[str]) -> list[dict]:
     return rows
 
 
+from metros import METROS as _METROS, metros_in as _metros_in  # noqa: E402
+
+_METRO_COUNTRY = {name: country for name, country, _ in _METROS}
+
+_cities_cache: tuple[float, dict[str, list[str]]] | None = None
+
+
+def _company_cities() -> dict[str, list[str]]:
+    """dedup key -> major metros the company has posted any job in, most postings first."""
+    global _cities_cache
+    now = time.time()
+    if _cities_cache and now - _cities_cache[0] < 600:
+        return _cities_cache[1]
+    counts: dict[str, dict[str, int]] = {}
+    try:
+        import internship_core as core
+        db = core.connect()
+        seen_loc: dict[str, list[str]] = {}
+        seen_key: dict[str, str] = {}
+        for q in ("SELECT company, location FROM postings",
+                  "SELECT company, location FROM ca_intern_history",
+                  "SELECT company, location FROM swe_intern_history"):
+            for company, loc in db.execute(q):
+                metros = seen_loc.get(loc)
+                if metros is None:
+                    metros = seen_loc[loc] = _metros_in(loc or "")
+                if not metros:
+                    continue
+                k = seen_key.get(company)
+                if k is None:
+                    k = seen_key[company] = _company_key(company or "")
+                if not k:
+                    continue
+                per = counts.setdefault(k, {})
+                for m in metros:
+                    per[m] = per.get(m, 0) + 1
+        db.close()
+    except Exception:  # noqa: BLE001
+        pass
+    out = {k: sorted(v, key=lambda m: (-v[m], m)) for k, v in counts.items()}
+    _cities_cache = (now, out)
+    return out
+
+
 def outreach_payload() -> dict:
     global _payload_cache
     now = time.time()
@@ -753,18 +836,161 @@ def outreach_payload() -> dict:
     us = _us_outreach()
     big5 = _big5_rows(canada, us)
     last = _last_intern_dates()
+    cities = _company_cities()
+    try:
+        import office_locations
+        offices = office_locations.load()
+    except Exception:  # noqa: BLE001
+        offices = {}
     try:
         import internship_core as core
         for part in (canada, us, big5):
             for r in part["rows"]:
-                hit = last.get(core.dedup_key(core.outreach_company_name(r.get("company") or "")))
+                key = core.dedup_key(core.outreach_company_name(r.get("company") or ""))
+                hit = last.get(key)
                 if hit:
                     r["last_intern_month"], r["last_intern_title"] = hit
+                # Offices from every current job (biggest first), then intern-posting cities.
+                office = offices.get(key) or {}
+                if part is canada and not any(_METRO_COUNTRY.get(m) == "CA" for m in office):
+                    office = {}  # US-only hits on the Canada tab are usually a same-name company
+                found = sorted(office, key=lambda m: (-office[m], m))
+                found += [m for m in cities.get(key, []) if m not in found]
+                for loc in r.get("interndb_locations") or []:
+                    for m in _metros_in(loc):
+                        if m not in found:
+                            found.append(m)
+                if not found:  # no postings/reviews: fall back to the HQ from its source list
+                    found = _metros_in(r.get("location") or "")
+                r["cities"] = found
     except Exception:  # noqa: BLE001
         pass
-    payload = {"canada": canada, "us": us, "big5": big5}
+    payload = {"canada": canada, "us": us, "big5": big5,
+               "metros": [{"name": n, "country": c} for n, c, _ in _METROS]}
     _payload_cache = (now, payload)
     return payload
+
+
+# Words that are also company names in the employer data but, as an event organizer or the first
+# word of one, almost always mean a community group or promoter rather than a company.
+_HOST_GENERIC = {
+    "toronto", "montreal", "ottawa", "canada", "ontario", "quebec", "gta", "mtl", "eventbrite",
+    "meetup", "luma", "events", "event", "community", "club", "network", "networking", "startup",
+    "startups", "tech", "global", "group", "the", "university", "college", "school", "city",
+    "center", "centre", "hub", "lab", "labs", "studio", "media", "productions", "entertainment",
+    "fun", "social", "international", "conference", "conferences", "summit", "festival", "art",
+    "music", "sports", "women", "black", "young", "future", "digital", "innovation", "creative",
+    "health", "business", "impact", "career", "careers", "jobs", "job", "ai", "data", "cloud",
+    "dev", "developers", "code", "design", "product", "growth", "capital", "venture", "ventures",
+}
+_HOST_PHRASE = re.compile(
+    r"\b(?:hosted|presented|sponsored|powered|organi[sz]ed)\s+by\s+((?:[A-Z0-9][\w&.'’-]*\s?){1,4})"
+    r"|\bat\s+((?:[A-Z0-9][\w&.'’-]*\s?){1,3})\s*(?:HQ|Headquarters|[Oo]ffices?)\b")
+_company_index_cache: tuple[float, dict[str, int]] = (0.0, {})
+_NOT_COMPANY = re.compile(r"\b(universit\w*|college|library|school|church|cégep|cegep)\b", re.I)
+_BIG_EMPLOYER = 300  # open US/CA jobs needed before a one-word name counts as that company
+# Short brand names that host lots of events but don't appear under that name in the job data.
+_KNOWN_BRANDS = {"aws", "td", "bmo", "cibc", "scotiabank", "ey", "pwc", "kpmg", "deloitte", "ea",
+                 "meta", "stripe", "shopify", "cohere", "github", "figma", "notion", "openai",
+                 "anthropic", "nvidia", "ibm", "sap", "telus", "rogers", "bell", "desjardins"}
+
+
+def _company_index(targets: dict[str, str]) -> dict[str, int]:
+    """{dedup key: size} for every known employer: the jobhive office data (~20K companies, size =
+    open jobs), interndb companies and the outreach lists. Cached 10 min."""
+    global _company_index_cache
+    now = time.time()
+    if now - _company_index_cache[0] < 600 and _company_index_cache[1]:
+        return _company_index_cache[1]
+    import internship_core as core
+    import office_locations
+    idx: dict[str, int] = {}
+    for k, metros in office_locations.load().items():
+        idx[k] = sum(metros.values())
+    try:
+        idb = json.loads((core.OUT_DIR / "interndb.json").read_text())
+    except (OSError, ValueError):
+        idb = {}
+    for name, rec in idb.items():
+        k = core.dedup_key(core.outreach_company_name(name))
+        if k:  # a company Canadian students reviewed is a real, known employer
+            idx[k] = max(idx.get(k, 0), _BIG_EMPLOYER if rec.get("reviews") else 5)
+    for k, part in targets.items():
+        idx[k] = max(idx.get(k, 0), _BIG_EMPLOYER if part == "big5" else 25)
+    for k in _KNOWN_BRANDS:
+        idx[k] = max(idx.get(k, 0), _BIG_EMPLOYER)
+    for g in _HOST_GENERIC:
+        idx.pop(g, None)
+    _company_index_cache = (now, idx)
+    return idx
+
+
+def _company_prefix(text: str, idx: dict[str, int], min_size: int) -> str:
+    """Longest leading run of words (up to 4) that names a known company, e.g.
+    'Google Developer Groups Toronto' -> 'Google'. '' when none does."""
+    import internship_core as core
+    words = re.findall(r"[\w&.'’-]+", text)
+    lead = 1 if words and words[0].lower() == "the" else 0  # 'The Gem' is still one real word
+    for n in range(min(4, len(words)), lead, -1):
+        cand = " ".join(words[:n]).strip(" &-|.,")
+        k = core.dedup_key(cand)
+        # A lone word ('Together', 'Open', 'Delta') only counts for a big employer (Google, Shopify).
+        need = max(min_size, _BIG_EMPLOYER) if n - lead == 1 else min_size
+        if (len(k) >= 3 or k in _KNOWN_BRANDS) and idx.get(k, 0) >= need:
+            return cand
+    return ""
+
+
+def _event_hosts(ev: dict, idx: dict[str, int]) -> list[str]:
+    """Companies that explicitly host an event: an organizer that is (or starts with) a known
+    company, or a 'hosted/presented/sponsored by X' / 'at X HQ' phrase in the title."""
+    import internship_core as core
+    hosts: list[str] = []
+    for name in ev.get("organizers") or []:
+        if _NOT_COMPANY.search(name):  # universities, libraries, schools: institutions, not companies
+            continue
+        k = core.dedup_key(core.outreach_company_name(name))
+        lone = len(re.findall(r"[\w&.'’-]+", name)) == 1
+        if len(k) >= 3 and idx.get(k, 0) >= (_BIG_EMPLOYER if lone else 3):
+            hosts.append(name)
+        elif hit := _company_prefix(name, idx, 20):
+            hosts.append(hit)
+    for m in _HOST_PHRASE.finditer(ev.get("title") or ""):
+        if hit := _company_prefix((m.group(1) or m.group(2) or "").strip(), idx, 3):
+            hosts.append(hit)
+    return list(dict.fromkeys(hosts))
+
+
+def events_payload() -> dict:
+    """Cached events. Each gets `hosts` (companies that explicitly host it) and `targets` (hosts
+    or organizers on an outreach list)."""
+    import events
+    import internship_core as core
+
+    data = dict(events.load())
+    targets: dict[str, str] = {}
+    try:
+        payload = outreach_payload()
+        for part in ("canada", "us", "big5"):
+            for r in payload.get(part, {}).get("rows", []):
+                k = core.dedup_key(core.outreach_company_name(r.get("company") or ""))
+                if k:
+                    targets.setdefault(k, part)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        idx = _company_index(targets)
+    except Exception:  # noqa: BLE001
+        idx = {}
+    out = []
+    for ev in data.get("events", []):
+        ev = dict(ev)
+        ev["hosts"] = _event_hosts(ev, idx) if idx else []
+        ev["targets"] = [n for n in dict.fromkeys(ev["hosts"] + (ev.get("organizers") or []))
+                         if core.dedup_key(core.outreach_company_name(n)) in targets]
+        out.append(ev)
+    data["events"] = out
+    return data
 
 
 def datetime_utc_iso(mtime: float) -> str:
@@ -814,6 +1040,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, (WEB / "outreach.html").read_bytes(), "text/html")
         if path == "/api/outreach":
             return self._json(200, outreach_payload())
+        if path == "/events":
+            return self._send(200, (WEB / "events.html").read_bytes(), "text/html")
+        if path == "/api/events":
+            return self._json(200, events_payload())
         if path == "/api/tracker":
             data = email_tracker.tracker_rows()
             data.update(syncing=sync_lock.locked(), sync_error=sync_error,

@@ -85,7 +85,7 @@ MIN = 60
 # Sources that are a whole site (not a list of companies in ats-companies/).
 SINGLE_SOURCES = {"cgi", "shopify", "janestreet", "linkedin", "careers_search", "discover", "bytedance", "google", "amazon", "apple", "meta", "tiktok", "uber", "tesla",
                   "jobbankca", "builtin", "ycombinator", "wellfound", "remoterocketship", "workopolis", "eluta",
-                  "simplifyjobs"}
+                  "simplifyjobs", "interninsider"}
 LIST_SOURCES = {
     "simplify": "https://raw.githubusercontent.com/SimplifyJobs/Summer2027-Internships/dev/.github/scripts/listings.json",
     "vanshb03": "https://raw.githubusercontent.com/vanshb03/Summer2027-Internships/dev/.github/scripts/listings.json",
@@ -611,7 +611,7 @@ def company_key(name: str) -> str:
     return norm_text(re.split(r"\s+[-–|(]\s*", name or "")[0]) or norm_text(name)
 
 
-LIST_ORIGINS = set(LIST_SOURCES) | {"linkedin", "remoterocketship", "workopolis", "eluta", "jobbankca", "builtin", "simplifyjobs"}  # ATS rows win duplicates
+LIST_ORIGINS = set(LIST_SOURCES) | {"linkedin", "remoterocketship", "workopolis", "eluta", "jobbankca", "builtin", "simplifyjobs", "interninsider"}  # ATS rows win duplicates
 
 
 def _city_key(location: str | None) -> str:
@@ -1997,6 +1997,39 @@ def _write_rows(path: Path, header: list[str], rows: list[list[str]]) -> None:
     tmp.replace(path)
 
 
+
+
+def _js_string_after(html: str, key: str) -> str | None:
+    """The JSON string literal right after the first `key` (e.g. 'streamController.enqueue(').
+    A plain scan, not the regex "(?:[^"\\]|\\.)*", which keeps a backtracking mark per
+    character and used ~140x the page size in memory (2026-11-14)."""
+    pos = html.find(key)
+    while pos >= 0:
+        start = pos + len(key)
+        if html.startswith('"', start):
+            try:
+                _, end = json.JSONDecoder().raw_decode(html, start)
+                return html[start:end]
+            except ValueError:
+                pass
+        pos = html.find(key, start)
+    return None
+
+def _next_f_strings(html: str) -> list[str]:
+    """The JSON string literals in a Next.js page's `self.__next_f.push([1,"..."])` calls."""
+    key, out, dec = "self.__next_f.push([1,", [], json.JSONDecoder()
+    pos = html.find(key)
+    while pos >= 0:
+        start = pos + len(key)
+        try:
+            _, end = dec.raw_decode(html, start)
+        except ValueError:
+            pos = html.find(key, start)
+            continue
+        out.append(html[start:end])
+        pos = html.find(key, end)
+    return out
+
 def log_line(text: str) -> None:
     line = f"{datetime.now():%Y-%m-%d %H:%M:%S} {text}"
     print(line, flush=True)
@@ -2334,8 +2367,12 @@ async def check_list(source: str, timeout: float) -> list[dict[str, Any]]:
                         "url": link, "posted_at": iso(x.get("posted")), "posted_text": "day precision"})
         return out
     if source == "earlycareerradar":
-        # The page embeds its whole list as JSON inside a Next.js payload string.
-        for chunk in re.findall(r'self\.__next_f\.push\(\[1,("(?:[^"\\]|\\.)*")\]\)', r.text):
+        # The page embeds its whole list as JSON inside a Next.js payload string. Find the strings
+        # with a plain scan: the old regex ("(?:[^"\\]|\\.)*") kept a backtracking mark per
+        # character and peaked at 1.4 GB on the 10 MB page (2026-11-14); this peaks at ~40 MB.
+        for chunk in _next_f_strings(r.text):
+            if "initialJobs" not in chunk:
+                continue
             text = json.loads(chunk)
             i = text.find('"initialJobs":')
             if i < 0:
@@ -2451,6 +2488,153 @@ async def check_remoterocketship(timeout: float) -> list[dict[str, Any]]:
     if failed == len(REMOTEROCKETSHIP_SEARCHES):
         raise RuntimeError("remoterocketship: no page had job data; the site probably changed")
     return list(out.values())
+
+
+# Intern Insider (interninsider.me): every open posting is listed in two sitemaps (~50K URLs, all
+# fields). Posting URLs carry the title as a slug, so only software-looking slugs are fetched; each
+# posting page embeds a JobPosting (company, place, date) and is read once, then cached. The two
+# "newest" listing pages are read too, in case the sitemap lags. The employer's apply link sits
+# behind their sign-in (and robots.txt), so rows link to the posting page; ATS rows still win
+# duplicates through LIST_ORIGINS. Each pass returns every open software internship (full snapshot).
+INTERNINSIDER = "https://interninsider.me"
+INTERNINSIDER_SITEMAPS = ("/sitemap-seo/jobs-open", "/sitemap-seo/jobs-open-2")
+INTERNINSIDER_PAGES = ("/internships/roles/software-engineering/canada", "/internships/roles/software-engineering")
+INTERNINSIDER_CACHE = OUT_DIR / ".status" / "interninsider_cache.json"
+INTERNINSIDER_CONCURRENCY = 2  # 4 got ~2/3 of posting pages refused on the first full pass
+_LD_JSON_RE = re.compile(r'<script type="application/ld\+json">(.*?)</script>', re.S)
+_II_ID_RE = re.compile(r"-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+def _ld_json(html: str, kind: str) -> list[dict[str, Any]]:
+    found = []
+    for block in _LD_JSON_RE.findall(html):
+        try:
+            data = json.loads(block)
+        except ValueError:
+            continue
+        for item in data if isinstance(data, list) else [data]:
+            if isinstance(item, dict) and item.get("@type") == kind:
+                found.append(item)
+    return found
+
+
+def _ii_slug_software(url: str) -> bool:
+    """Cheap pre-filter on the URL's title slug ('software-engineering-co-op-<uuid>')."""
+    words = _II_ID_RE.sub("", url.rsplit("/", 1)[-1]).replace("-", " ")
+    # Every posting on the board is an internship, and slugs lose 'co-op' hyphens, so also try with 'intern'.
+    return is_software_internship(words) or is_software_internship(words + " intern")
+
+
+def _ii_save_cache(cache: dict[str, dict[str, Any]]) -> None:
+    tmp = INTERNINSIDER_CACHE.with_suffix(".tmp")
+    tmp.parent.mkdir(parents=True, exist_ok=True)
+    tmp.write_text(json.dumps(cache))
+    os.replace(tmp, INTERNINSIDER_CACHE)
+
+
+def _ii_posting(html: str) -> dict[str, Any] | None:
+    posts = _ld_json(html, "JobPosting")
+    if not posts:
+        return None
+    jp = posts[0]
+    locs = jp.get("jobLocation") or []
+    places = []
+    for loc in locs if isinstance(locs, list) else [locs]:
+        a = (loc or {}).get("address") or {}
+        country = {"CA": "Canada", "US": "United States"}.get(a.get("addressCountry") or "", a.get("addressCountry"))
+        place = ", ".join(v for v in (a.get("addressLocality"), a.get("addressRegion"), country) if v)
+        if place:
+            places.append(place)
+    return {"company": ((jp.get("hiringOrganization") or {}).get("name") or "").strip(),
+            "title": (jp.get("title") or "").strip(), "place": "; ".join(places),
+            "posted_at": iso(jp.get("datePosted")), "valid_through": iso(jp.get("validThrough")),
+            "seen": datetime.now(UTC).isoformat(timespec="seconds")}
+
+
+async def check_interninsider(timeout: float) -> list[dict[str, Any]]:
+    """Intern Insider: every open software internship (US + Canada), via its sitemaps and JSON-LD."""
+    try:
+        cache: dict[str, dict[str, Any]] = json.loads(INTERNINSIDER_CACHE.read_text())
+    except (OSError, ValueError):
+        cache = {}
+    open_urls: list[str] = []
+    total_open = 0
+    async with httpx.AsyncClient(timeout=max(timeout, 60), follow_redirects=True,
+                                 headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) Chrome/128"}) as client:
+        for path in INTERNINSIDER_SITEMAPS:
+            r = await client.get(INTERNINSIDER + path)
+            locs = [m[1] for m in re.finditer(r"<loc>([^<]+)</loc>", r.text)
+                    if _ii_slug_software(m[1]) or "/internships/" not in m[1]] if r.status_code == 200 else []
+            n_open = len(re.findall(r"<loc>", r.text)) if r.status_code == 200 else 0
+            status = r.status_code
+            del r  # ~7 MB of XML; only the software URLs are kept
+            if not locs:
+                # Without the full list a snapshot would wrongly close every posting it misses.
+                raise RuntimeError(f"interninsider: sitemap {path} empty or HTTP {status}; the site probably changed")
+            open_urls += locs
+            total_open += n_open
+            await asyncio.sleep(2)
+        for path in INTERNINSIDER_PAGES:  # newest postings, in case the sitemap lags
+            r = await client.get(INTERNINSIDER + path)
+            await asyncio.sleep(2)
+            for lst in (_ld_json(r.text, "ItemList") if r.status_code == 200 else [])[:1]:
+                open_urls += [it.get("url") or "" for it in lst.get("itemListElement") or []]
+        listed = list(dict.fromkeys(u for u in open_urls if u.startswith(INTERNINSIDER + "/internships/")
+                                    and u.count("/") == 5 and _ii_slug_software(u)))
+        todo = [u for u in listed if u not in cache]
+        sem = asyncio.Semaphore(INTERNINSIDER_CONCURRENCY)
+        fetched = failed = 0
+        why: dict[str, int] = {}
+
+        async def read(u: str) -> None:
+            nonlocal fetched, failed
+            async with sem:
+                r = None
+                for attempt in range(2):
+                    try:
+                        r = await client.get(u)
+                    except httpx.HTTPError as exc:
+                        r, reason = None, type(exc).__name__
+                    else:
+                        reason = str(r.status_code)
+                    await asyncio.sleep(0.5)
+                    if r is None or r.status_code in (403, 429, 503):  # throttled: back off once, then retry
+                        await asyncio.sleep(20)
+                        continue
+                    break
+            row = _ii_posting(r.text) if r is not None and r.status_code == 200 else None
+            if row is None:
+                failed += 1
+                why[reason if r is None or r.status_code != 200 else "no JobPosting"] = \
+                    why.get(reason if r is None or r.status_code != 200 else "no JobPosting", 0) + 1
+                return
+            cache[u] = row
+            fetched += 1
+            if fetched % 250 == 0:  # keep progress if a long first pass gets killed
+                _ii_save_cache(cache)
+
+        await asyncio.gather(*(read(u) for u in todo))
+    log_line(f"{'interninsider':16} {total_open} open, {len(listed)} software by URL, "
+             f"{fetched} new posting pages read, {failed} failed {why or ''}")
+    now = datetime.now(UTC)
+    cutoff = (now - timedelta(days=60)).isoformat(timespec="seconds")
+    live = set(listed)
+    cache = {u: v for u, v in cache.items() if u in live or (v.get("seen") or "") >= cutoff}
+    _ii_save_cache(cache)
+    out = []
+    for u in listed:
+        v = cache.get(u)
+        if not v or (v.get("valid_through") and v["valid_through"] < now.isoformat(timespec="seconds")):
+            continue
+        # The country is the last part of each place; spell it out ("…, CA" also means California).
+        place = "; ".join(re.sub(r", (CA|US)$", lambda m: ", Canada" if m[1] == "CA" else ", United States", s)
+                          for s in v["place"].split("; "))
+        loc = keep(v["title"], place)
+        if loc is None:
+            continue
+        out.append({"company": v["company"], "title": v["title"], "location": loc, "url": u,
+                    "posted_at": v["posted_at"]})
+    return out
 
 
 # simplify.jobs carries far more postings than Simplify's GitHub list. Its search is a Typesense
@@ -2930,10 +3114,10 @@ async def check_shopify(timeout: float) -> list[dict[str, Any]]:
                                  headers={"User-Agent": "Mozilla/5.0"}) as client:
         r = await client.get(SHOPIFY_CAREERS)
         r.raise_for_status()
-    m = re.search(r'streamController\.enqueue\(("(?:[^"\\]|\\.)*")\)', r.text)
+    m = _js_string_after(r.text, "streamController.enqueue(")
     if not m:
         raise RuntimeError("Shopify careers page has no embedded job data")
-    root = _turbo_decode(json.loads(json.loads(m.group(1))))
+    root = _turbo_decode(json.loads(json.loads(m)))
     loader = next((v for k, v in (root.get("loaderData") or {}).items()
                    if k.endswith("careers") and isinstance(v, dict) and "jobPostingsWithJobs" in v), None)
     if loader is None:
@@ -3168,6 +3352,8 @@ async def check_single(source: str, timeout: float) -> list[dict[str, Any]]:
         return await check_jobbank(timeout)
     if source == "remoterocketship":
         return await check_remoterocketship(timeout)
+    if source == "interninsider":
+        return await check_interninsider(timeout)
     if source == "builtin":
         return await check_builtin(timeout)
     if source == "simplifyjobs":
@@ -3477,10 +3663,10 @@ def _jobs_from_page(page_html: str, base: str) -> list[dict[str, Any]]:
             blobs.append(json.loads(m[1]))
         except ValueError:
             pass
-    m = re.search(r'streamController\.enqueue\(("(?:[^"\\]|\\.)*")\)', page_html)
+    m = _js_string_after(page_html, "streamController.enqueue(")
     if m:
         try:
-            blobs.append(_turbo_decode(json.loads(json.loads(m[1]))))
+            blobs.append(_turbo_decode(json.loads(json.loads(m))))
         except (ValueError, IndexError, KeyError, TypeError):
             pass
     found: list[dict[str, Any]] = []
@@ -4815,6 +5001,7 @@ PASS_WALL_MAX = 45 * MIN  # kill a pass still running after this (the longest no
 # Sources that update slowly: read them at most this often (seconds), even on faster cycles.
 MIN_GAP = {"interndock": 30 * MIN, "cgi": 30 * MIN, "linkedin": 15 * MIN, "workopolis": 30 * MIN,
            "eluta": 60 * MIN,  # reCAPTCHA after a burst; see ELUTA_SEARCHES
+           "interninsider": 10 * MIN,  # 2 sitemaps (~8 MB) + new software posting pages (cached)
            "eightfold": 180 * MIN,  # Eightfold's AWS WAF flags an IP that polls it often
            "builtin": 20 * MIN,  # ~60 pages a pass
            "simplifyjobs": 15 * MIN,  # headless browser, up to SIMPLIFYJOBS_MAX_PAGES scrolls
@@ -4897,7 +5084,7 @@ async def run_pass(source: str, max_tenants: int | None, timeout: float, tenant_
             try:
                 if single:
                     company_key = source
-                    cap = 1800 if source in ("careers_search", "discover", "careers") else 900 if source in (
+                    cap = 1800 if source in ("careers_search", "discover", "careers", "interninsider") else 900 if source in (
                         "cgi", "linkedin", "workopolis", "eluta", "ycombinator", "google", "wellfound") else tenant_cap * 4  # CGI reads ~59 pages slowly
                     items = await asyncio.wait_for(check_single(source, timeout), cap)
                     for it in items:

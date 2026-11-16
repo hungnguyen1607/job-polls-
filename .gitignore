@@ -172,3 +172,6 @@ distributed/**/*.db
 
 # personal resumes (were tracked before the repo went public)
 Hung*Resume.*
+
+# Personal resume notes, never commit
+resume_bullet_bank.md
