@@ -2624,7 +2624,10 @@ async def check_interninsider(timeout: float) -> list[dict[str, Any]]:
     out = []
     for u in listed:
         v = cache.get(u)
-        if not v or (v.get("valid_through") and v["valid_through"] < now.isoformat(timespec="seconds")):
+        # Every software posting still in the open sitemap is kept, regardless of its
+        # valid_through (Intern Insider leaves expired-but-listed roles up); only skip when we
+        # have no JobPosting row at all.
+        if not v:
             continue
         # The country is the last part of each place; spell it out ("…, CA" also means California).
         place = "; ".join(re.sub(r", (CA|US)$", lambda m: ", Canada" if m[1] == "CA" else ", United States", s)
