@@ -984,7 +984,11 @@ def events_payload() -> dict:
         idx = {}
     out = []
     for ev in data.get("events", []):
+        kind = events.event_kind(ev)  # tech + professional-networking events only
+        if not kind:
+            continue
         ev = dict(ev)
+        ev["kind"] = kind
         ev["hosts"] = _event_hosts(ev, idx) if idx else []
         ev["targets"] = [n for n in dict.fromkeys(ev["hosts"] + (ev.get("organizers") or []))
                          if core.dedup_key(core.outreach_company_name(n)) in targets]

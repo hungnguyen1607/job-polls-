@@ -44,6 +44,8 @@
     <label><input type="checkbox" id="hosted" checked> Company-hosted only</label>
     <label><input type="checkbox" id="targets"> My target companies</label>
     <label><input type="checkbox" id="free"> Free only</label>
+    <label><input type="checkbox" id="kindTech" checked> Tech</label>
+    <label><input type="checkbox" id="kindNet" checked> Networking</label>
   </div>
   <table>
     <thead><tr><th>Date</th><th>Event</th><th>Hosted by</th><th>City</th><th>Price</th></tr></thead>
@@ -69,8 +71,10 @@
   function render() {
     const q = $("#q").value.trim().toLowerCase();
     const onlyHosted = $("#hosted").checked, onlyTargets = $("#targets").checked, onlyFree = $("#free").checked;
+    const showTech = $("#kindTech").checked, showNet = $("#kindNet").checked;
     const shown = events.filter((e) => {
       if (city && e.city !== city) return false;
+      if (e.kind === "networking" ? !showNet : !showTech) return false;
       if (onlyHosted && !(e.hosts || []).length) return false;
       if (onlyTargets && !(e.targets || []).length) return false;
       if (onlyFree && e.price !== "Free") return false;
@@ -86,7 +90,7 @@
         : `<span class="src">${(e.organizers || []).map(tag).join(", ")}</span>`;
       return `<tr>
         <td class="n">${when(e)}</td>
-        <td><a href="${esc(e.url)}" target="_blank" rel="noopener">${esc(e.title)}</a><div class="src">${esc(e.venue || "")}${e.venue ? " · " : ""}${esc(e.source)}${(e.also_on || []).length ? `, ${esc(e.also_on.join(", "))}` : ""}</div></td>
+        <td><a href="${esc(e.url)}" target="_blank" rel="noopener">${esc(e.title)}</a>${e.kind === "networking" ? '<span class="t">networking</span>' : ""}<div class="src">${esc(e.venue || "")}${e.venue ? " · " : ""}${esc(e.source)}${(e.also_on || []).length ? `, ${esc(e.also_on.join(", "))}` : ""}</div></td>
         <td>${orgs}</td>
         <td class="m">${esc(e.city)}</td>
         <td class="n">${esc(e.price || "")}</td>
@@ -94,7 +98,9 @@
     }).join("") || `<tr><td class="m" colspan="5">${meta.refreshing && !events.length ? "Collecting events… this first run takes a few minutes." : "No events"}</td></tr>`;
     const nTargets = events.filter((e) => (e.targets || []).length).length;
     const nHosted = events.filter((e) => (e.hosts || []).length).length;
-    $("#sub").textContent = `${shown.length} shown · ${nHosted} of ${events.length} upcoming events in Toronto, Montreal and Ottawa are hosted by a company · ${nTargets} by companies on your outreach list`
+    const nTech = events.filter((e) => e.kind === "tech").length;
+    const nNet = events.filter((e) => e.kind === "networking").length;
+    $("#sub").textContent = `${shown.length} shown · ${nTech} tech + ${nNet} networking across Toronto, Montreal and Ottawa · ${nHosted} company-hosted · ${nTargets} by companies on your outreach list`
       + (meta.updated ? ` · updated ${new Date(meta.updated).toLocaleString("en-CA")}` : "") + (meta.refreshing ? " · refreshing…" : "");
     const c = meta.counts || {};
     $("#counts").textContent = Object.keys(c).length ? "Sources: " + Object.entries(c).map(([k, v]) => `${k} ${v}`).join(" · ") : "";
@@ -117,7 +123,7 @@
     city = b.dataset.city;
     render();
   }));
-  ["#q", "#hosted", "#targets", "#free"].forEach((s) => $(s).addEventListener("input", render));
+  ["#q", "#hosted", "#targets", "#free", "#kindTech", "#kindNet"].forEach((s) => $(s).addEventListener("input", render));
 
   load();
   setInterval(load, 60_000);

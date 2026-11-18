@@ -373,6 +373,85 @@ def _start_dt(s: str) -> datetime | None:
     return None
 
 
+# ---- tech-only filter -----------------------------------------------------------------------
+# Hackathon feeds are tech by definition; everything else from the broad Eventbrite / Luma /
+# Meetup / AllEvents categories must mention something software/tech-related in its title,
+# organizer, or venue to be kept. Drops the business / networking / social / wellness noise.
+TECH_SOURCES = {"devpost", "mlh"}
+_TECH_RE = re.compile(
+    r"\b(?:"
+    r"tech|technolog|software|hardware|developer|dev(?:ops|fest|s)?\b|engineer|programming|"
+    r"coding|hackathon|hack ?night|hackfest|startup|\bdata\b|analytics|"
+    r"artificial intelligence|machine learning|a\.?i\.?\b|ml\b|llm\b|deep learning|neural|"
+    r"generative|cloud|web3?|web ?dev|cyber|security|infosec|blockchain|crypto|devops|"
+    r"python|javascript|typescript|react\b|node(?:\.?js)?\b|java\b|rust\b|golang|kubernetes|"
+    r"docker|api\b|saas|ux\b|ui\b|robotics|iot\b|open ?source|github|database|sql\b|"
+    r"frontend|front-end|backend|back-end|full ?-?stack|computer science|"
+    r"information technology|demo day|founders?\b|product manage|quantum|vr\b|xr\b|"
+    r"game ?dev|fintech|biotech|no-?code|low-?code|gpt|openai|anthropic|nvidia|aws\b|azure|"
+    r"gcp\b|digital product|automation"
+    r")",
+    re.I,
+)
+
+
+def _event_hay(ev: dict) -> str:
+    return " ".join([
+        ev.get("title") or "",
+        ev.get("venue") or "",
+        " ".join(ev.get("organizers") or []),
+    ])
+
+
+def is_tech_event(ev: dict) -> bool:
+    """True if the event is software/tech-related: a hackathon source, or its title /
+    organizer / venue matches a tech keyword."""
+    srcs = {ev.get("source")} | set(ev.get("also_on") or [])
+    if srcs & TECH_SOURCES:
+        return True
+    return bool(_TECH_RE.search(_event_hay(ev)))
+
+
+# ---- networking / career filter -------------------------------------------------------------
+# Genuine tech networking (dev mixers, startup/founder socials) is already caught by the tech
+# matcher, so this bucket only ADDS real career/recruiting venues (career fairs, job fairs,
+# hiring events, recruiting nights) that happen to lack a tech keyword. Bare "networking" /
+# "mixer" is intentionally NOT here — it pulls finance/real-estate/entrepreneur/social noise.
+# The negative guard drops clearly non-tech-industry career events.
+_NETWORKING_RE = re.compile(
+    r"\b(?:"
+    r"career fair|job fair|job expo|career expo|hiring (?:event|fair|mixer|day)|"
+    r"recruit(?:ing|er|ment)|meet the team|career (?:day|night|week)|"
+    r"employer (?:info session|networking|showcase)|tech(?:nical)? recruit"
+    r")\b",
+    re.I,
+)
+_NON_TECH_NETWORKING_RE = re.compile(
+    r"\b(?:"
+    r"real ?estate|realtor|mortgage|insurance|network marketing|mlm|beauty|lash|skincare|"
+    r"wellness|yoga|fitness|spiritual|psychic|singles|dating|wine tasting|"
+    r"healthcare|pharma|nursing|dental|construction|hospitality"
+    r")\b",
+    re.I,
+)
+
+
+def is_networking_event(ev: dict) -> bool:
+    """True if the event is a professional/career networking event (and not a non-tech-industry
+    mixer like real estate / MLM / wellness)."""
+    hay = _event_hay(ev)
+    return bool(_NETWORKING_RE.search(hay)) and not _NON_TECH_NETWORKING_RE.search(hay)
+
+
+def event_kind(ev: dict) -> str | None:
+    """'tech', 'networking', or None (drop). Tech wins when an event is both."""
+    if is_tech_event(ev):
+        return "tech"
+    if is_networking_event(ev):
+        return "networking"
+    return None
+
+
 def build() -> dict:
     rows: list[dict] = []
     counts: dict[str, int | str] = {}
